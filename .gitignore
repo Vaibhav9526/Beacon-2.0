@@ -1,0 +1,15 @@
+node_modules/
+.next/
+.expo/
+.expo-ui-check/
+dist/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.db
+*.log
+backend/.venv/
+apps/dashboard/.next-stale-*/
+.env
+.env.local
+.impeccable/review/

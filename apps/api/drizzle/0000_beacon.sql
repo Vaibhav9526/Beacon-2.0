@@ -1,0 +1,33 @@
+CREATE EXTENSION IF NOT EXISTS postgis;
+
+DO $$ BEGIN CREATE TYPE trust_state AS ENUM ('Unverified','Corroborated','Verified','Misleading','Outdated'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE TYPE official_role AS ENUM ('admin','responder'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+CREATE TABLE IF NOT EXISTS citizens (id text PRIMARY KEY, name text NOT NULL, phone text NOT NULL, language text NOT NULL DEFAULT 'en', device_id text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+CREATE UNIQUE INDEX IF NOT EXISTS citizen_phone_device ON citizens(phone, device_id);
+CREATE TABLE IF NOT EXISTS citizen_sessions (id text PRIMARY KEY, citizen_id text NOT NULL REFERENCES citizens(id) ON DELETE CASCADE, device_id text NOT NULL, expires_at timestamptz NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS citizen_sessions_expiry_idx ON citizen_sessions(expires_at);
+CREATE TABLE IF NOT EXISTS official_users (id text PRIMARY KEY, name text NOT NULL, email text NOT NULL UNIQUE, password text NOT NULL, role official_role NOT NULL, organization text NOT NULL, jurisdiction text NOT NULL, mfa_ready boolean NOT NULL DEFAULT true);
+CREATE TABLE IF NOT EXISTS official_sessions (id text PRIMARY KEY, official_user_id text NOT NULL REFERENCES official_users(id) ON DELETE CASCADE, expires_at timestamptz NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS official_sessions_expiry_idx ON official_sessions(expires_at);
+CREATE TABLE IF NOT EXISTS incidents (id text PRIMARY KEY, title text NOT NULL, hazard_type text NOT NULL, severity text NOT NULL, trust_state trust_state NOT NULL DEFAULT 'Unverified', latitude double precision NOT NULL, longitude double precision NOT NULL, location geometry(Point,4326), approximate_area text NOT NULL, report_count integer NOT NULL DEFAULT 1, status text NOT NULL DEFAULT 'New', analysis_summary text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS incidents_location_gix ON incidents USING GIST(location);
+CREATE TABLE IF NOT EXISTS reports (id text PRIMARY KEY, citizen_id text NOT NULL REFERENCES citizens(id), incident_id text NOT NULL REFERENCES incidents(id), hazard_type text NOT NULL, severity text NOT NULL, original_text text NOT NULL, translated_text text NOT NULL, requested_help text, latitude double precision NOT NULL, longitude double precision NOT NULL, location geometry(Point,4326), approximate_area text NOT NULL, trust_state trust_state NOT NULL DEFAULT 'Unverified', media jsonb NOT NULL DEFAULT '[]', created_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS reports_location_gix ON reports USING GIST(location);
+CREATE TABLE IF NOT EXISTS media_evidence (id text PRIMARY KEY, report_id text NOT NULL REFERENCES reports(id) ON DELETE CASCADE, provider text NOT NULL, storage_key text NOT NULL, url text NOT NULL, secure_url text, original_name text NOT NULL, mime_type text NOT NULL, resource_type text NOT NULL, bytes integer NOT NULL, sha256 text NOT NULL, fallback_reason text, created_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS media_evidence_report_idx ON media_evidence(report_id);
+CREATE INDEX IF NOT EXISTS media_evidence_sha256_idx ON media_evidence(sha256);
+CREATE TABLE IF NOT EXISTS analysis_runs (id text PRIMARY KEY, incident_id text NOT NULL REFERENCES incidents(id), provider text NOT NULL, latency_ms integer NOT NULL, confidence double precision, result jsonb NOT NULL, errors jsonb NOT NULL DEFAULT '[]', fallback_path jsonb NOT NULL DEFAULT '[]', created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS sos_requests (id text PRIMARY KEY, citizen_id text NOT NULL REFERENCES citizens(id), latitude double precision NOT NULL, longitude double precision NOT NULL, location geometry(Point,4326), note text NOT NULL, status text NOT NULL DEFAULT 'New', created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS sos_location_gix ON sos_requests USING GIST(location);
+CREATE TABLE IF NOT EXISTS assignments (id text PRIMARY KEY, sos_id text REFERENCES sos_requests(id), incident_id text REFERENCES incidents(id), responder_id text NOT NULL REFERENCES official_users(id), status text NOT NULL DEFAULT 'Assigned', eta_minutes integer NOT NULL, operational_note text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS facilities (id text PRIMARY KEY, name text NOT NULL, kind text NOT NULL, latitude double precision NOT NULL, longitude double precision NOT NULL, location geometry(Point,4326), capacity integer, verified boolean NOT NULL DEFAULT true, updated_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS facilities_location_gix ON facilities USING GIST(location);
+CREATE TABLE IF NOT EXISTS communities (id text PRIMARY KEY, name text NOT NULL, incident_id text REFERENCES incidents(id), radius_km double precision NOT NULL DEFAULT 2, approved boolean NOT NULL DEFAULT false, member_count integer NOT NULL DEFAULT 0, created_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE communities ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'proposed';
+CREATE TABLE IF NOT EXISTS messages (id text PRIMARY KEY, community_id text NOT NULL REFERENCES communities(id), sender_name text NOT NULL, sender_role text NOT NULL, body text NOT NULL, official boolean NOT NULL DEFAULT false, created_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS moderation_status text NOT NULL DEFAULT 'visible';
+CREATE TABLE IF NOT EXISTS alerts (id text PRIMARY KEY, incident_id text REFERENCES incidents(id), title text NOT NULL, body text NOT NULL, severity text NOT NULL, status text NOT NULL DEFAULT 'active', superseded_by text, published_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz);
+CREATE TABLE IF NOT EXISTS corrections (id text PRIMARY KEY, alert_id text NOT NULL REFERENCES alerts(id), replacement_alert_id text NOT NULL, reason text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS audit_events (id text PRIMARY KEY, actor_id text NOT NULL, action text NOT NULL, entity_type text NOT NULL, entity_id text NOT NULL, reason text, detail jsonb NOT NULL DEFAULT '{}', created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS delivery_attempts (id text PRIMARY KEY, entity_type text NOT NULL, entity_id text NOT NULL, channel text NOT NULL, status text NOT NULL, detail text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());

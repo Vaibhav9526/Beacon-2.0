@@ -1,0 +1,564 @@
+BEACON — SIH PRESENTATION QUESTIONS AND MODEL ANSWERS
+====================================================
+
+Use these answers as speaking notes. Do not memorize every sentence. Lead with the
+one-line answer, then add technical detail only if the judge asks for it.
+
+
+30-SECOND INTRODUCTION
+----------------------
+
+BEACON is a human-governed crisis-intelligence platform that converts multilingual
+citizen reports into verified, locally actionable incidents. Citizens can report
+with text, voice, photo, video and location, or send an SOS. The authority command
+centre receives it in real time, sees AI-assisted duplicate and misinformation
+analysis, verifies the evidence, assigns responders, and publishes an official
+alert or correction. Unverified citizen claims are always kept separate from
+official guidance.
+
+
+1. WHAT PROBLEM ARE YOU SOLVING?
+
+During a disaster, information is fragmented across calls, social media and local
+messages. Authorities receive duplicates and misinformation, while citizens cannot
+easily distinguish official alerts from unverified claims. BEACON creates one
+traceable route from local evidence to verification, response and trusted public
+communication.
+
+
+2. WHAT IS YOUR SOLUTION IN ONE SENTENCE?
+
+BEACON is a multilingual reporting, verification and emergency-response system that
+turns citizen evidence into human-approved incidents, assignments and alerts in real
+time.
+
+
+3. WHO ARE THE USERS?
+
+There are three users: citizens who report incidents or request help, authority
+admins who verify and publish information, and responders who receive assignments
+and update their field status.
+
+
+4. WHAT MAKES BEACON DIFFERENT FROM A NORMAL DISASTER-REPORTING APP?
+
+Most systems focus on either reporting, alerts or responder management. BEACON
+connects all three. Its important differentiators are five explicit trust states,
+multilingual evidence preservation, duplicate clustering, privacy-aware AI, audited
+human decisions, corrections, SOS dispatch, and a strict visual separation between
+unverified claims and official guidance.
+
+
+5. SHOW US THE COMPLETE USER JOURNEY.
+
+A citizen registers, selects a language, and submits a fresh report with evidence
+and location. The backend searches for nearby related incidents using PostGIS,
+checks text similarity and media hashes, and runs the AI analysis gateway. The
+incident appears instantly on the dashboard through Redis-backed WebSockets. An
+admin reviews the original evidence and analysis, verifies it or uses an audited
+emergency bypass, assigns a responder, and publishes an alert. The citizen receives
+the status or alert in real time. If facts change, the authority publishes a
+correction that visibly supersedes the previous alert.
+
+
+6. WHY IS THE APP MAP-FIRST?
+
+Disaster information is spatial. A map immediately answers: What is near me? Is the
+claim official? Where is the nearest hospital or shelter? BEACON combines that map
+with a draggable safety sheet so the critical actions—Report and SOS—remain easy to
+reach on a phone.
+
+
+7. HOW DO YOU PREVENT UNVERIFIED INFORMATION FROM CAUSING PANIC?
+
+New reports start as Unverified and never enter the official alert feed
+automatically. They can appear only on a separately labelled optional claims layer.
+Official alerts use a shield label and a separate data path. Only an authorized
+admin can verify or publish an incident.
+
+
+8. WHAT ARE YOUR TRUST STATES?
+
+Unverified means not yet confirmed. Corroborated means supported by multiple related
+reports but not officially approved. Verified means approved by an authority.
+Misleading means contradicted or deceptive. Outdated means the information was once
+relevant but should no longer guide current action.
+
+
+9. DOES AI DECIDE WHAT IS TRUE?
+
+No. AI is a decision-support layer, not the source of official truth. It summarizes,
+translates, detects duplicate signals, highlights possible misinformation indicators
+and recommends a trust state. An authorized human makes the official decision. The
+public is never shown an AI confidence value as a “truth percentage.”
+
+
+10. WHERE IS THE “AI BRAIN” IN THE PRODUCT?
+
+Every report produces a stored AnalysisRun. The gateway records the provider,
+latency, validated output, confidence, errors, fallback path and redactions. The
+dashboard exposes specialist views for linguistic analysis, duplicate/radar signals,
+media evidence and recommended action, together with provenance so the operator can
+understand why a suggestion was made.
+
+
+11. WHICH AI MODELS DO YOU USE?
+
+The gateway tries Gemini first, Groq second, and then a deterministic local analyzer.
+The prototype currently remains fully demonstrable without cloud keys because the
+local analyzer handles normalization, duplicate evidence, risk signals and approved
+protocol selection. Adding configured provider keys activates the cloud stages
+without changing the application workflow.
+
+
+12. WHAT HAPPENS IF EVERY AI PROVIDER FAILS?
+
+The report is retained as Unverified, analysis is marked unavailable, and it remains
+visible for human review. It is never silently discarded. SOS requests bypass this
+analysis dependency and are always delivered to the emergency queue.
+
+
+13. HOW DO YOU DETECT DUPLICATE REPORTS?
+
+We first narrow candidates by hazard type, time window and geographic distance using
+PostGIS ST_DWithin. We then compare normalized multilingual text and SHA-256 media
+hashes. Matching reports are attached to one incident while every original report
+and media item remains preserved. The default geographic threshold is configurable
+and is currently 2.5 kilometres.
+
+
+14. WHAT IF TWO INCIDENTS ARE NEAR EACH OTHER BUT ARE ACTUALLY DIFFERENT?
+
+Location alone does not cause a merge. Hazard type, time, text similarity and media
+evidence are also considered. The authority can review the original submissions and
+keep incidents separate; merge/split remains a human-governed operational action.
+
+
+15. HOW DO YOU DETECT MISINFORMATION?
+
+BEACON looks for contradictions, suspicious wording, duplicate/reused media,
+corroborating nearby evidence and recency. These are indicators, not an automatic
+verdict. The authority reviews the evidence before marking an incident Misleading.
+That decision is audited and any related active alert is corrected or superseded.
+
+
+16. HOW DO YOU HANDLE MULTILINGUAL REPORTS?
+
+The interface supports English, Hindi and Chhattisgarhi. We preserve the original
+language content beside its English translation so an authority can inspect the
+source. Voice and translation are adapters, meaning better speech or language models
+can be added without changing the incident workflow.
+
+
+17. WHY INCLUDE CHHATTISGARHI?
+
+Emergency tools fail when citizens must translate themselves under stress. A local
+language reduces friction, improves inclusion and preserves the local meaning of a
+report. The architecture can add more regional languages through the same adapter
+pattern.
+
+
+18. HOW DOES SOS WORK?
+
+The user must press and hold, which reduces accidental activation. A short
+cancellation countdown provides another safeguard. Once confirmed, the SOS appears
+in the authority priority queue and can continue receiving location updates until it
+is cancelled or resolved. Assignment and responder ETA/status updates return to the
+same citizen session.
+
+
+19. WHY MUST SOS NEVER BE REJECTED BY AI?
+
+AI uncertainty must not become a barrier to emergency assistance. SOS is treated as
+an operational request, not as a truth-classification problem. AI may assist the
+operator, but it cannot block, delete or downgrade the request.
+
+
+20. HOW DOES REAL-TIME SYNCHRONIZATION WORK?
+
+Clients connect through authenticated WebSockets. The API publishes domain events
+through Redis Pub/Sub, allowing multiple API instances to distribute the same event.
+Events are audience-scoped: authorities receive operational incidents, while a
+citizen receives public updates and only their own precise SOS/dispatch information.
+
+
+21. WHY USE REDIS?
+
+Redis supports low-latency Pub/Sub for real-time events, shared rate-limit counters
+and future queue/store-and-forward workloads. It also prevents realtime behavior
+from being tied to a single API process, which is important when horizontally
+scaling.
+
+
+22. WHY USE POSTGRESQL, POSTGIS AND DRIZZLE?
+
+PostgreSQL gives durable transactional records; PostGIS provides correct spatial
+queries for nearby incidents and geofences; Drizzle provides a typed schema and
+migrations shared with the TypeScript API. This is more production-shaped than
+storing geographic data as unstructured JSON or relying on in-memory state.
+
+
+23. WHY DID YOU USE FASTIFY INSTEAD OF THE ORIGINAL FASTAPI PLAN?
+
+The active prototype uses Fastify so the Next.js dashboard, Expo client contracts,
+Drizzle models and realtime server share one TypeScript ecosystem. Fastify also has
+low overhead and strong schema/plugin support. The earlier FastAPI implementation is
+retained as a fallback/reference, but the Docker runtime has one clear active API to
+avoid split ownership.
+
+
+24. WHAT DOES DOCKER PROVIDE?
+
+Docker Compose starts four reproducible services: the dashboard, API, PostGIS and
+Redis. Health checks verify the dependencies before the demo. Persistent volumes
+retain database, Redis and locally stored evidence across ordinary restarts.
+
+
+25. HOW DO YOU PROTECT PERSONAL DATA BEFORE USING CLOUD AI?
+
+Before any cloud-AI request, BEACON redacts known names, phone numbers, email
+addresses and exact coordinate patterns. Precise locations remain in the operational
+database and are not included in the public map. The analysis audit records which
+redaction classes were applied without exposing the removed value.
+
+
+26. WHO CAN SEE PRECISE LOCATIONS?
+
+Precise coordinates are stored only where operationally needed—for reports, active
+SOS and authorized assignments. Public views receive an approximate area. Realtime
+events are audience-scoped so one citizen cannot subscribe to another citizen's SOS
+location.
+
+
+27. HOW IS AUTHENTICATION HANDLED?
+
+The prototype issues expiring device-bound citizen sessions and expiring authority
+sessions. Authority passwords are stored using salted scrypt hashes. Protected
+mutations require bearer tokens, ownership is checked server-side, and anonymous
+WebSocket connections are rejected. The model includes organization, jurisdiction,
+role and MFA-ready fields for production onboarding.
+
+
+28. WHY IS CITIZEN REGISTRATION ALLOWED WITHOUT OTP?
+
+It keeps the live prototype usable when SMS credentials or mobile delivery are not
+available. Abuse is reduced with device sessions and Redis rate limits. Production
+deployment would add verified OTP or government-approved identity onboarding based
+on the deployment policy.
+
+
+29. WHAT IS THE EMERGENCY “BYPASS VERIFICATION” FEATURE?
+
+It lets a privileged admin publish rapidly when waiting would create greater harm.
+It requires an explicit reason and creates an immutable audit event. In the demo it
+is scoped to test users. It is not a hidden shortcut and should require stronger
+role checks and confirmation in production.
+
+
+30. HOW DO CORRECTIONS WORK?
+
+The old alert is marked as superseded, a Correction record is linked to it, and a
+replacement alert is published. The correction is sent through the same recipient
+delivery pipeline and broadcast in real time. Users therefore see that previous
+guidance is outdated instead of silently seeing edited history.
+
+
+31. WHAT IS IN THE AUDIT TRAIL?
+
+Consequential actions—report creation, verification decisions, bypasses, alert
+publication, corrections, assignments, facility changes and moderation—record the
+actor, action, entity, timestamp, reason and relevant structured detail. This makes
+decisions reviewable after an incident.
+
+
+32. HOW DO MEDIA UPLOADS WORK?
+
+Photo, video and audio evidence are accepted through multipart uploads with file
+count and size limits. Files receive SHA-256 hashes for integrity and duplicate
+signals. The media adapter uses Cloudinary when all required configuration is
+present; otherwise it uses durable local storage so evidence capture still works.
+
+
+33. IS CLOUDINARY ACTIVE IN THIS DEMO?
+
+The Cloudinary adapter is configured, but the current restricted API key does not
+have the provider's media “create” permission. BEACON therefore records the failed
+cloud attempt and safely stores the evidence in its persistent local volume. Once an
+upload-enabled key is supplied, the same adapter uses Cloudinary without an app-code
+change. Secrets stay in an ignored environment file and are never embedded in the
+mobile app or tracked source files.
+
+
+34. WHAT HAPPENS DURING POOR OR NO CONNECTIVITY?
+
+The mobile app caches the latest safety context and clearly timestamps cached
+information. Reports can enter an offline outbox and retry when connectivity
+returns. Server delivery follows in-app realtime, configured push, configured SMS,
+then queued store-and-forward. The current prototype does not claim peer-to-peer
+mesh networking.
+
+
+35. WHAT IS REAL DATA AND WHAT IS DEMO DATA?
+
+Maps come from OpenStreetMap and weather comes from Open-Meteo. The incident shown
+during judging is created live rather than pre-seeded. Authority accounts and
+facilities are local demo records. No live government emergency feed or direct 112
+integration is claimed.
+
+
+36. WHY OPENSTREETMAP AND OPEN-METEO?
+
+They provide real geographic and current weather context without requiring paid keys
+for the prototype. Both are isolated behind application services so an authorized
+government map, weather or routing provider can replace them later.
+
+
+37. HOW DO YOU PRIORITIZE THE AUTHORITY QUEUE?
+
+SOS requests are presented as the highest operational priority. Incidents are then
+ordered by severity, trust/review need and recency. This prevents the command centre
+from behaving like a simple chronological inbox.
+
+
+38. HOW DO COMMUNITIES HELP?
+
+An authority can create or approve an incident-area community for localized updates
+and mutual help. Official messages are visually labelled, precise citizen locations
+are protected, users may opt out, and authority moderation actions are audited.
+
+
+39. CAN AI GENERATE MEDICAL ADVICE?
+
+No. BEACON uses an approved static safety-protocol library. AI may select a relevant
+protocol, but it cannot invent diagnoses, medication or treatment. This keeps safety
+guidance bounded and reviewable.
+
+
+40. HOW IS THE SYSTEM ACCESSIBLE?
+
+The mobile design uses large touch targets, screen-reader labels, scalable text,
+plain-language status text and non-color indicators. The dashboard supports keyboard
+navigation, visible focus, focus-trapped dialogs and reduced-motion behavior.
+Critical trust states are communicated with text and icons, not color alone.
+
+
+41. HOW WILL THIS SCALE?
+
+The API is stateless apart from PostgreSQL and Redis, so multiple API containers can
+run behind a load balancer. PostGIS spatial indexes can narrow nearby searches,
+Cloudinary/object storage can serve media, and background workers can process AI and
+delivery queues. Jurisdiction partitioning and retention policies would be added for
+multi-district deployment.
+
+
+42. WHAT IS YOUR DEPLOYMENT PLAN?
+
+Phase one is a controlled pilot with one district authority, trained operators and
+test recipients. Phase two integrates approved SMS/push providers and government
+feeds. Phase three introduces multi-jurisdiction tenancy, formal MFA, disaster
+recovery, observability, data-retention controls and audited production onboarding.
+
+
+43. WHAT IS THE BUSINESS OR ADOPTION MODEL?
+
+BEACON is best positioned as government or institutional infrastructure rather than
+a consumer subscription. A state, district, municipal authority, campus or NGO can
+operate it as a managed deployment. Costs are driven mainly by hosting, media,
+messages and optional AI usage; open map/weather sources and the local AI fallback
+keep pilot costs low.
+
+
+44. WHAT KPIs WOULD YOU MEASURE IN A PILOT?
+
+We would measure report-to-acknowledgement time, verification time, duplicate
+reduction, SOS assignment time, correction delivery success, alert reach, offline
+queue recovery, false merge/split rate, operator workload, and citizen comprehension
+of official versus unverified information. We would not claim lives saved without a
+proper field study.
+
+
+45. HOW WOULD YOU VALIDATE THE AI?
+
+Create a labelled multilingual dataset with disaster-management experts, including
+duplicates, unrelated nearby events, misinformation, outdated reports and noisy
+media. Evaluate recall and precision for duplicate suggestions and risk indicators
+separately by language and hazard. Human overrides and corrections become feedback
+for evaluation, but production model updates require review rather than automatic
+self-training.
+
+
+46. WHAT ARE THE BIGGEST RISKS?
+
+The largest risks are malicious reports, operator overload, location privacy,
+provider outages and public over-trust in AI. Our controls are rate limits, evidence
+retention, clustering, role-based human approval, approximate public locations,
+provider fallbacks, corrections and explicit trust labels.
+
+
+47. WHAT ATTACKS HAVE YOU CONSIDERED?
+
+We considered identity spoofing, cross-citizen data leakage, anonymous realtime
+subscriptions, report flooding, oversized uploads and secret leakage. The prototype
+uses server-derived identity, ownership checks, authenticated audience-scoped
+WebSockets, Redis rate limits, upload limits, hashed authority passwords and log
+redaction. A production security review and penetration test would still be required.
+
+
+48. WHAT HAVE YOU ACTUALLY TESTED?
+
+The mobile TypeScript check and Expo diagnostics pass, the Next.js production build
+passes, and API unit tests validate PII redaction and deterministic AI behavior. The
+integration smoke test verifies PostgreSQL/PostGIS, Redis, the AI fallback, media
+storage and 16 scoped realtime events. A separate smoke test submits a citizen report,
+receives its WebSocket event and confirms it appears in the authenticated authority
+queue. The Android UI and live OpenStreetMap were also checked on an emulator.
+
+
+49. WHAT IS NOT YET PRODUCTION-READY?
+
+Direct 112 integration, formal MFA/onboarding, government data contracts, production
+push/SMS credentials, peer-to-peer Bluetooth/Wi-Fi mesh, nationwide jurisdiction
+management, formal security certification, load testing and field validation are
+not part of this judge prototype. We state these limits clearly rather than
+simulating integrations we do not have.
+
+
+50. WHY SHOULD THIS PROJECT WIN?
+
+BEACON addresses the hardest part of crisis communication: turning noisy local
+reports into accountable action without pretending AI is the authority. The
+prototype demonstrates the whole loop on real devices and real infrastructure—map,
+multimedia evidence, spatial clustering, AI provenance, human verification,
+dispatch, alerts, corrections and realtime synchronization—with practical fallback
+behavior when optional services fail.
+
+
+DIFFICULT FOLLOW-UP QUESTIONS
+-----------------------------
+
+51. “ISN'T THIS JUST ANOTHER CRUD DASHBOARD?”
+
+No. The value is in the stateful trust and response pipeline: spatial clustering of
+independent evidence, persisted AI provenance, human-controlled verification,
+audited override, audience-scoped realtime delivery, SOS ownership and correction
+propagation. The dashboard is the operational interface to that pipeline.
+
+
+52. “WHAT IF TEN PEOPLE COPY THE SAME FALSE MESSAGE?”
+
+Volume alone does not make a report Verified. Multiple reports can raise it only to
+Corroborated, and copied text or matching media is visible as duplicate evidence.
+Official verification still requires an authorized human and supporting evidence.
+
+
+53. “WHAT IF AN AUTHORITY MISUSES THE BYPASS?”
+
+The action requires privilege, explicit confirmation and a reason, and it produces
+an immutable audit entry. Production policy can require dual approval for high-impact
+alerts and trigger an independent review of every bypass.
+
+
+54. “WHY NOT USE BLOCKCHAIN FOR THE AUDIT LOG?”
+
+The immediate requirement is append-only accountability with controlled access,
+transactional consistency and reliable operations. A conventional audited database
+is simpler and easier for authorities to operate. Cryptographic signing or an
+external immutable archive can be added if policy requires it; blockchain is not
+necessary to prove the product workflow.
+
+
+55. “HOW DO YOU KNOW A PHOTO IS FROM THE REPORTED LOCATION?”
+
+We do not claim that a photo alone proves location. We preserve upload metadata and
+hashes, compare it with nearby independent reports, and allow field responders to
+corroborate conditions. Future production work could add capture attestation and
+device integrity checks, but human verification remains necessary.
+
+
+56. “WHY NOT SIMPLY USE WHATSAPP GROUPS?”
+
+Messaging groups are useful for communication but do not provide structured trust
+states, geospatial incident clustering, responder assignments, corrections to all
+prior recipients, protected operational locations or a formal audit trail. BEACON
+can complement familiar messaging channels through delivery adapters.
+
+
+57. “WHAT HAPPENS IF REDIS GOES DOWN?”
+
+Redis realtime and shared rate limiting become unavailable, but PostgreSQL remains
+the source of durable operational truth. Clients reconcile through REST and queued
+delivery can resume when Redis returns. Production would use managed Redis with
+replication and monitoring.
+
+
+58. “WHAT HAPPENS IF POSTGRESQL GOES DOWN?”
+
+The health endpoint fails readiness so traffic should not be routed to that API
+instance. The mobile outbox retains new non-SOS reports for retry. Production needs
+database replication, backups, point-in-time recovery and a documented emergency
+degraded-mode procedure.
+
+
+59. “CAN THIS WORK IN A VILLAGE WITH WEAK INTERNET?”
+
+The current app caches safety packs and queues reports for reconnection, and the
+delivery architecture supports configured SMS fallback. True no-network operation
+between devices would require the deferred Bluetooth/Wi-Fi Direct mesh adapter. We
+do not claim that capability in this prototype.
+
+
+60. “HOW WILL YOU AVOID VENDOR LOCK-IN?”
+
+Maps, weather, AI, media and message delivery are behind adapters. Gemini can fall
+back to Groq and local analysis; Cloudinary can fall back to local/object storage;
+and delivery can move from WebSockets to push, SMS or queues. Core incidents,
+evidence and audit data remain in PostgreSQL/PostGIS.
+
+
+LIVE DEMO NARRATION
+-------------------
+
+1. “There is no pre-seeded disaster. I am creating a live citizen report now.”
+2. Show the mobile map, current weather, facilities and official/unverified legend.
+3. Submit text plus media/location, or activate the hold-to-SOS flow.
+4. “The command centre received the event through authenticated Redis-backed
+   WebSockets; this is not a manual refresh.”
+5. Open the incident and point to original evidence, duplicate signals, provider,
+   fallback path and AI redactions.
+6. “AI recommends; it cannot publish. I am verifying this as the authority.”
+7. Assign the responder and update the status/ETA.
+8. Publish an official alert and show it arrive on the citizen app.
+9. Publish a correction and show the old alert visibly superseded.
+10. Open the audit trail and show the actor, action, reason and timestamp.
+
+
+IF SOMETHING FAILS DURING THE DEMO
+----------------------------------
+
+Map unavailable:
+“The operational workflow does not depend on map tiles. Coordinates and PostGIS
+queries still work, while the UI shows cached context and allows a manual pin.”
+
+Cloud AI unavailable:
+“The provider failure is recorded, PII stays protected, and the deterministic local
+analyzer continues. The report remains human-reviewable.”
+
+Realtime temporarily disconnected:
+“The connection state is explicit. PostgreSQL remains the source of truth and the
+client reconciles through REST while the socket reconnects.”
+
+Media provider unavailable:
+“The adapter records the Cloudinary failure and uses durable local storage, so the
+evidence is not lost.”
+
+Internet unavailable:
+“The local Docker network still demonstrates report, verification, dispatch and
+alerts. The citizen app uses cached safety context and queues reports for retry.”
+
+
+FINAL CLOSING LINE
+------------------
+
+BEACON does not ask citizens to trust an algorithm. It helps authorities turn local
+evidence into faster, accountable and clearly communicated action—even when
+connectivity or optional providers fail.

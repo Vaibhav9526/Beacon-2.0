@@ -1,0 +1,21 @@
+{
+  "name": "beacon-prototype",
+  "private": true,
+  "workspaces": ["apps/api", "apps/dashboard", "apps/mobile", "apps/telegram-bot"],
+  "scripts": {
+    "dev:web": "npm --workspace apps/dashboard run dev",
+    "build:web": "npm --workspace apps/dashboard run build",
+    "dev:mobile": "npm --workspace apps/mobile run start",
+    "dev:api": "npm --workspace apps/api run dev",
+    "dev:telegram": "npm --workspace apps/telegram-bot run dev",
+    "build:api": "npm --workspace apps/api run build",
+    "test:api": "npm --workspace apps/api run test",
+    "test:telegram": "npm --workspace apps/telegram-bot run test",
+    "db:generate": "npm --workspace apps/api run db:generate",
+    "db:push": "npm --workspace apps/api run db:push",
+    "docker:up": "docker compose up --build -d",
+    "docker:down": "docker compose down",
+    "smoke:realtime": "node scripts/smoke-realtime.mjs",
+    "smoke:telegram": "node scripts/smoke-telegram.mjs"
+  }
+}

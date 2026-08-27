@@ -1,0 +1,127 @@
+name: beacon
+
+services:
+  postgis:
+    image: postgis/postgis:17-3.5-alpine
+    environment:
+      POSTGRES_DB: beacon
+      POSTGRES_USER: beacon
+      POSTGRES_PASSWORD: beacon
+    ports:
+      - "5432:5432"
+    volumes:
+      - beacon_postgis:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U beacon -d beacon"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - beacon_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://beacon:beacon@postgis:5432/beacon
+      REDIS_URL: redis://redis:6379
+      PORT: 8000
+      HOST: 0.0.0.0
+      UPLOAD_DIR: /app/data/uploads
+      PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:8000}
+      ALLOW_DEMO_AUTH: ${ALLOW_DEMO_AUTH:-true}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      BHASHINI_COMPUTE_URL: ${BHASHINI_COMPUTE_URL:-}
+      BHASHINI_COMPUTE_AUTH_NAME: ${BHASHINI_COMPUTE_AUTH_NAME:-}
+      BHASHINI_COMPUTE_AUTH_VALUE: ${BHASHINI_COMPUTE_AUTH_VALUE:-}
+      BHASHINI_NMT_SERVICE_ID: ${BHASHINI_NMT_SERVICE_ID:-}
+      GOOGLE_FACT_CHECK_API_KEY: ${GOOGLE_FACT_CHECK_API_KEY:-}
+      VERIFICATION_TIMEOUT_MS: ${VERIFICATION_TIMEOUT_MS:-5000}
+      VERIFICATION_MAX_SOURCES: ${VERIFICATION_MAX_SOURCES:-8}
+      CLOUDINARY_CLOUD_NAME: ${CLOUDINARY_CLOUD_NAME:-}
+      CLOUDINARY_API_KEY: ${CLOUDINARY_API_KEY:-}
+      CLOUDINARY_API_SECRET: ${CLOUDINARY_API_SECRET:-}
+      CLOUDINARY_FOLDER: ${CLOUDINARY_FOLDER:-beacon/evidence}
+      CLUSTER_DISTANCE_METERS: ${CLUSTER_DISTANCE_METERS:-2500}
+      CLUSTER_WINDOW_HOURS: ${CLUSTER_WINDOW_HOURS:-2}
+      CLUSTER_TEXT_SIMILARITY: ${CLUSTER_TEXT_SIMILARITY:-0.38}
+      FCM_SERVER_KEY: ${FCM_SERVER_KEY:-}
+      FCM_TEST_TOKENS: ${FCM_TEST_TOKENS:-}
+      MSG91_AUTH_KEY: ${MSG91_AUTH_KEY:-}
+      MSG91_TEMPLATE_ID: ${MSG91_TEMPLATE_ID:-}
+      MSG91_TEST_RECIPIENTS: ${MSG91_TEST_RECIPIENTS:-}
+      MSG91_MESSAGE_VARIABLE: ${MSG91_MESSAGE_VARIABLE:-BEACON_MESSAGE}
+    ports:
+      - "8000:8000"
+    volumes:
+      - beacon_uploads:/app/data/uploads
+    depends_on:
+      postgis:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8000/api/v1/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: apps/dashboard/Dockerfile
+    environment:
+      NEXT_TELEMETRY_DISABLED: "1"
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: apps/telegram-bot/Dockerfile
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_SESSION_TTL_SECONDS: ${TELEGRAM_SESSION_TTL_SECONDS:-2592000}
+      TELEGRAM_HEALTH_PORT: 8082
+      BEACON_API_URL: http://api:8000/api/v1
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "8082:8082"
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8082').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  beacon_postgis:
+  beacon_redis:
+  beacon_uploads:

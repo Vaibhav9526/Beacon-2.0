@@ -1,0 +1,43 @@
+{
+  "expo": {
+    "name": "BEACON",
+    "slug": "beacon-citizen",
+    "version": "1.0.0",
+    "icon": "./assets/beacon-logo.png",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "image": "./assets/beacon-logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#000000"
+    },
+    "android": {
+      "package": "in.beacon.citizen",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/beacon-logo.png",
+        "backgroundColor": "#000000"
+      },
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "CAMERA",
+        "RECORD_AUDIO"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "BEACON uses your location to place reports and route emergency assistance."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "BEACON attaches selected evidence to your report.",
+          "cameraPermission": "BEACON uses the camera to capture incident evidence."
+        }
+      ],
+      "expo-audio"
+    ]
+  }
+}

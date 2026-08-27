@@ -1,0 +1,13 @@
+node_modules
+**/node_modules
+**/.next
+**/.next*
+**/.expo
+**/dist
+**/__pycache__
+backend/.venv
+uploads
+*.log
+*.db
+.git
+.impeccable

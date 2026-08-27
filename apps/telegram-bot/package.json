@@ -1,0 +1,20 @@
+{
+  "name": "@beacon/telegram-bot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "ioredis": "^5.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "~6.0.3",
+    "vitest": "^3.2.4"
+  }
+}

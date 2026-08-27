@@ -1,0 +1,18 @@
+{
+  "name": "@beacon/dashboard",
+  "private": true,
+  "scripts": {"dev": "next dev", "build": "next build", "start": "next start", "lint": "next lint"},
+  "dependencies": {
+    "@fontsource-variable/manrope": "^5.2.6",
+    "@fontsource-variable/newsreader": "^5.2.6",
+    "@tailwindcss/postcss": "^4.1.12",
+    "leaflet": "^1.9.4",
+    "lucide-react": "^0.468.0",
+    "next": "16.3.3",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "sharp": "^0.35.0",
+    "tailwindcss": "^4.1.12"
+  },
+  "devDependencies": {"@types/leaflet": "^1.9.15", "@types/node": "^22.10.2", "@types/react": "^19.2.4", "typescript": "^5.7.2"}
+}
