@@ -32,6 +32,29 @@ services:
       retries: 20
     restart: unless-stopped
 
+  textbelt:
+    build:
+      context: ./vendor/textbelt
+      dockerfile: Dockerfile
+    environment:
+      PORT: 9090
+      TEXTBELT_SMTP_HOST: ${TEXTBELT_SMTP_HOST:-}
+      TEXTBELT_SMTP_PORT: ${TEXTBELT_SMTP_PORT:-587}
+      TEXTBELT_SMTP_USER: ${TEXTBELT_SMTP_USER:-}
+      TEXTBELT_SMTP_PASS: ${TEXTBELT_SMTP_PASS:-}
+      TEXTBELT_SMTP_SECURE: ${TEXTBELT_SMTP_SECURE:-false}
+      TEXTBELT_FROM: ${TEXTBELT_FROM:-BEACON <beacon@localhost.invalid>}
+    ports:
+      # Textbelt has no built-in authentication. Keep its diagnostic port local;
+      # the authenticated API reaches it over the private Compose network.
+      - "127.0.0.1:9090:9090"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9090/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+    restart: unless-stopped
+
   api:
     build:
       context: .
@@ -45,7 +68,11 @@ services:
       PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:8000}
       ALLOW_DEMO_AUTH: ${ALLOW_DEMO_AUTH:-true}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
+      GEMINI_TRANSLATION_MODEL: ${GEMINI_TRANSLATION_MODEL:-gemini-3.5-flash-lite}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+      ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-3-5-haiku-latest}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
       BHASHINI_COMPUTE_URL: ${BHASHINI_COMPUTE_URL:-}
@@ -68,6 +95,12 @@ services:
       MSG91_TEMPLATE_ID: ${MSG91_TEMPLATE_ID:-}
       MSG91_TEST_RECIPIENTS: ${MSG91_TEST_RECIPIENTS:-}
       MSG91_MESSAGE_VARIABLE: ${MSG91_MESSAGE_VARIABLE:-BEACON_MESSAGE}
+      TEXTBELT_URL: http://textbelt:9090
+      TEXTBELT_REGION: ${TEXTBELT_REGION:-intl}
+      TEXTBELT_TEST_RECIPIENTS: ${TEXTBELT_TEST_RECIPIENTS:-}
+      TEXTBELT_SMTP_HOST: ${TEXTBELT_SMTP_HOST:-}
+      TEXTBELT_SMTP_USER: ${TEXTBELT_SMTP_USER:-}
+      TEXTBELT_SMTP_PASS: ${TEXTBELT_SMTP_PASS:-}
     ports:
       - "8000:8000"
     volumes:
@@ -76,6 +109,8 @@ services:
       postgis:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      textbelt:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8000/api/v1/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]

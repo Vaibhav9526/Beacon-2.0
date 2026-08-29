@@ -35,9 +35,10 @@ The judge demonstration runs on an Android phone and desktop connected to the sa
 - Reports may include text, voice, photo, video, GPS or a manual pin, hazard type, severity, and requested help.
 - Trust states are `Unverified`, `Corroborated`, `Verified`, `Misleading`, and `Outdated`; only official content appears in the authoritative feed.
 - SOS uses press-and-hold plus a cancellation countdown and is never rejected or discarded by AI.
-- Cloud AI calls remove names, phone numbers, and precise coordinates; Gemini falls back to Groq and then deterministic local analysis.
+- Cloud AI calls remove names, phone numbers, and precise coordinates; Claude performs the first analysis/fact-check synthesis pass, then falls back to Gemini, Groq, and deterministic local analysis.
 - Delivery order is in-app realtime, configured push, configured MSG91 SMS, then queued store-and-forward.
-- Direct 112 integration, peer-to-peer mesh, nationwide onboarding, government feed contracts, formal MFA, facial recognition, and a volunteer marketplace are deferred.
+- Citizens can create a PII-safe safety packet and hand it to Android's system share sheet for an intentional nearby relay through Quick Share, Bluetooth, Wi-Fi Direct, messaging, or another installed transport. Automatic peer discovery and background mesh routing require a signed native Android adapter and remain deferred.
+- Direct 112 integration, automatic peer-to-peer mesh, nationwide onboarding, government feed contracts, formal MFA, facial recognition, and a volunteer marketplace are deferred.
 - This is a judge prototype, not a publicly deployable emergency service. Outbound communication is restricted to test recipients.
 
 ## Brand Commitments

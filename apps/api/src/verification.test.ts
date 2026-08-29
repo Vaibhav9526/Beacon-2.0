@@ -11,6 +11,7 @@ describe("external claim verification", () => {
     vi.stubEnv("GOOGLE_FACT_CHECK_API_KEY", "test-fact-check-key");
     vi.stubEnv("VERIFICATION_TIMEOUT_MS", "1000");
     vi.stubEnv("VERIFICATION_MAX_SOURCES", "8");
+    vi.stubEnv("GROQ_API_KEY", "");
   });
 
   afterEach(() => {
@@ -55,6 +56,8 @@ describe("external claim verification", () => {
     expect(result.verdict).toBe("Contradicted");
     expect(result.status).toBe("complete");
     expect(result.human_review_required).toBe(true);
+    expect(result.confidence).toBeGreaterThanOrEqual(.7);
+    expect(result.confidence_basis).toContain("published fact-check");
     expect(result.summary).toContain("1 published fact-check");
     expect(result.sources).toEqual(expect.arrayContaining([
       expect.objectContaining({
@@ -65,7 +68,7 @@ describe("external claim verification", () => {
       }),
       expect.objectContaining({ kind: "news", url: "https://news.example/raipur-dam" }),
     ]));
-    expect(result.providers).toEqual(["Google Fact Check Tools", "GDELT DOC 2.0"]);
+    expect(result.providers).toEqual(["Google Fact Check Tools", "GDELT DOC 2.0", "groq-web-search:not-configured"]);
   });
 
   it("describes multi-publisher news as corroborating coverage, never proof", async () => {
@@ -81,6 +84,8 @@ describe("external claim verification", () => {
     expect(result.verdict).toBe("Corroborating coverage");
     expect(result.summary).toContain("corroboration, not proof");
     expect(result.human_review_required).toBe(true);
+    expect(result.confidence).toBeGreaterThan(.4);
+    expect(result.confidence).toBeLessThanOrEqual(.7);
     expect(result.providers).toContain("google-fact-check:not-configured");
   });
 
@@ -94,6 +99,7 @@ describe("external claim verification", () => {
     expect(result.verdict).toBe("Insufficient external evidence");
     expect(result.sources).toEqual([]);
     expect(result.errors).toHaveLength(2);
+    expect(result.confidence).toBe(.1);
     expect(result.human_review_required).toBe(true);
   });
 });

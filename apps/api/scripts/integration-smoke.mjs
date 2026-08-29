@@ -28,11 +28,16 @@ await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = rejec
 const anonymous = new WebSocket(base.replace(/^http/, "ws") + "/ws");
 const anonymousClose = await new Promise((resolve, reject) => { anonymous.onclose = (event) => resolve(event.code); anonymous.onerror = () => {}; setTimeout(() => reject(new Error("Anonymous WebSocket was not rejected")), 4_000); });
 check(anonymousClose === 1008, "Anonymous WebSocket did not close with policy violation");
+check(await status("/citizens/session", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }) === 400, "Malformed citizen session did not return a controlled validation error");
 
 const session = await json("/citizens/session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "Smoke Test Citizen", phone: "9000000001", language: "en", device_id: "smoke-device" }) });
 const otherSession = await json("/citizens/session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "Other Citizen", phone: "9000000002", language: "en", device_id: "other-device" }) });
 check(session.token.startsWith("cses_"), "Citizen registration did not issue an opaque session");
 const citizenAuth = { Authorization: `Bearer ${session.token}` };
+check(await status("/sos", { method: "POST", headers: { ...citizenAuth, "Content-Type": "application/json" }, body: JSON.stringify({ citizen_id: session.citizen.id, latitude: 999, longitude: 81.6296 }) }) === 400, "Out-of-range SOS coordinates were accepted");
+await json("/demo/reset", { method: "POST", headers: authority, body: "{}" });
+const sessionAfterReset = await json("/sos/active", { headers: citizenAuth });
+check(sessionAfterReset.sos === null, "Demo reset invalidated an active citizen device session");
 const citizenEvents = [], otherEvents = [];
 const citizenWs = new WebSocket(base.replace(/^http/, "ws") + `/ws?token=${encodeURIComponent(session.token)}`);
 const otherWs = new WebSocket(base.replace(/^http/, "ws") + `/ws?token=${encodeURIComponent(otherSession.token)}`);
@@ -60,11 +65,14 @@ check(await status("/reports", { method: "POST", headers: citizenAuth, body: inv
 const unauthForm = new FormData();
 Object.entries({ citizen_id: session.citizen.id, hazard_type: "flood", severity: "low", text: "Unauthenticated report attempt", latitude: "21.2515", longitude: "81.6297" }).forEach(([key, value]) => unauthForm.set(key, value));
 check(await status("/reports", { method: "POST", body: unauthForm }) === 401, "Unauthenticated citizen report was accepted");
-check(await status(`/incidents/${report.incident.id}/bypass`, { method: "POST", headers: { Authorization: "Bearer official_responder", "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true, reason: "Must not be authorized" }) }) === 403, "Responder bypass authorization failed");
+const responderBypassStatus = await status(`/incidents/${report.incident.id}/bypass`, { method: "POST", headers: { Authorization: "Bearer official_responder", "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true, reason: "Must not be authorized" }) });
+check([401, 403].includes(responderBypassStatus), "Responder bypass authorization failed");
 
 const incident = await json(`/incidents/${report.incident.id}/bypass`, { method: "POST", headers: authority, body: JSON.stringify({ confirmed: true, reason: "Smoke test emergency publication path" }) });
 check(incident.trust_state === "Verified", "Bypass did not verify incident");
 const alert = await json("/alerts", { method: "POST", headers: authority, body: JSON.stringify({ incident_id: incident.id, title: "Smoke test advisory", body: "Avoid the affected test area.", severity: "high" }) });
+const sms = await json("/authority/sms", { method: "POST", headers: authority, body: JSON.stringify({ incident_id: incident.id, title: "Smoke test safety update", message: "This is an audited BEACON test message for configured demo recipients." }) });
+check(["queued", "accepted", "delivered"].includes(sms.status), "Authority SMS was neither accepted nor queued");
 const context = await json("/context?lat=21.2514&lon=81.6296");
 check(context.verified_incidents.some((item) => item.id === incident.id), "Verified map layer missing incident");
 check(context.alerts.some((item) => item.id === alert.id && Number.isFinite(item.latitude)), "Official alert location missing");
@@ -93,6 +101,7 @@ await new Promise((resolve) => setTimeout(resolve, 350));
 check(events.some((event) => event.event === "incident.created"), "Realtime incident event missing");
 check(events.some((event) => event.event === "dispatch.updated"), "Realtime dispatch event missing");
 check(events.some((event) => event.event === "alert.corrected"), "Realtime correction event missing");
+check(events.some((event) => event.event === "delivery.sms"), "Realtime SMS delivery event missing");
 check(citizenEvents.some((event) => event.event === "sos.created" && event.payload.id === sos.id), "Owner did not receive scoped SOS event");
 check(citizenEvents.some((event) => event.event === "dispatch.updated" && event.payload.sos_id === sos.id), "Owner did not receive scoped dispatch event");
 check(!otherEvents.some((event) => ["sos.created", "sos.location", "dispatch.updated"].includes(event.event)), "Other citizen received private SOS/dispatch data");
@@ -102,8 +111,10 @@ check(audit.some((entry) => entry.action === "verification_bypassed"), "Immutabl
 check(audit.some((entry) => entry.action === "message_flagged"), "Moderation audit missing");
 check(audit.some((entry) => entry.action === "alert_auto_corrected"), "Automatic alert correction audit missing");
 check(audit.some((entry) => entry.action === "external_source_check_refreshed"), "External source-check audit missing");
+check(audit.some((entry) => ["sms_queued", "sms_dispatched"].includes(entry.action)), "Authority SMS audit entry missing");
 const queue = await json("/authority/queue", { headers: authority });
-check(queue.delivery.some((entry) => entry.channel === "sms/msg91" && entry.status === "not_configured"), "Delivery fallback ledger missing SMS result");
+check(queue.sms?.provider?.includes("Textbelt") && Number.isFinite(queue.sms?.test_recipient_count), "SMS readiness metadata missing");
+check(queue.delivery.some((entry) => entry.entity_type === "manual_sms" && ["sms/textbelt", "sms/msg91"].includes(entry.channel)), "Manual SMS delivery ledger entry missing");
 
 ws.close(); citizenWs.close(); otherWs.close();
 await json("/demo/reset", { method: "POST", headers: authority, body: "{}" });

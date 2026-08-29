@@ -13,3 +13,11 @@ apps/dashboard/.next-stale-*/
 .env
 .env.local
 .impeccable/review/
+.artifacts/
+.tools/
+*.apk
+*_QR.png
+apps/api/apps/
+pnpm-lock.yaml
+Extension/*.zip
+**/.git-local-metadata/

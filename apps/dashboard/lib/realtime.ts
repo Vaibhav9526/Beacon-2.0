@@ -1,11 +1,11 @@
-import { getWsUrl } from "./api";
+import { getCurrentToken, getWsUrl } from "./api";
 
 export type RealtimeState = "connecting" | "live" | "retrying" | "offline";
 
 export function connectRealtime(
   onEvent: (message: { event: string; payload: any }) => void,
   onState: (state: RealtimeState) => void,
-  token: string | (() => string | undefined) = "official_admin",
+  token: string | (() => string | undefined) = getCurrentToken,
 ) {
   let socket: WebSocket | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -24,6 +24,7 @@ export function connectRealtime(
     }
     const credential = typeof token === "function" ? token() : token;
     clear();
+    if (!credential) { onState("offline"); return; }
     onState(attempt ? "retrying" : "connecting");
     socket = new WebSocket(getWsUrl(credential));
     socket.onopen = () => {

@@ -3,18 +3,13 @@
     "name": "BEACON",
     "slug": "beacon-citizen",
     "version": "1.0.0",
-    "icon": "./assets/beacon-logo.png",
+    "icon": "./assets/beacon-icon-square.png",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
-    "splash": {
-      "image": "./assets/beacon-logo.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#000000"
-    },
     "android": {
       "package": "in.beacon.citizen",
       "adaptiveIcon": {
-        "foregroundImage": "./assets/beacon-logo.png",
+        "foregroundImage": "./assets/beacon-icon-square.png",
         "backgroundColor": "#000000"
       },
       "permissions": [
@@ -37,7 +32,17 @@
           "cameraPermission": "BEACON uses the camera to capture incident evidence."
         }
       ],
-      "expo-audio"
+      "expo-audio",
+      "expo-font",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/beacon-icon-square.png",
+          "resizeMode": "contain",
+          "backgroundColor": "#000000",
+          "imageWidth": 220
+        }
+      ]
     ]
   }
 }

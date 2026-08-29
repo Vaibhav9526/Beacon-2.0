@@ -54,7 +54,7 @@ export const communities = pgTable("communities", {
 });
 
 export const messages = pgTable("messages", {
-  id: text("id").primaryKey(), communityId: text("community_id").notNull().references(() => communities.id), senderName: text("sender_name").notNull(), senderRole: text("sender_role").notNull(), body: text("body").notNull(), official: boolean("official").notNull().default(false), moderationStatus: text("moderation_status").notNull().default("visible"), ...stamps,
+  id: text("id").primaryKey(), communityId: text("community_id").notNull().references(() => communities.id), senderName: text("sender_name").notNull(), senderRole: text("sender_role").notNull(), body: text("body").notNull(), sourceLanguage: text("source_language").notNull().default("en"), translations: jsonb("translations").notNull().default({}), official: boolean("official").notNull().default(false), moderationStatus: text("moderation_status").notNull().default("visible"), ...stamps,
 });
 
 export const alerts = pgTable("alerts", {

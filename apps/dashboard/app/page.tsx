@@ -4,7 +4,9 @@ import dynamic from "next/dynamic";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
+  BarChart3,
   BellRing,
+  BrainCircuit,
   CheckCircle2,
   ChevronRight,
   CircleAlert,
@@ -15,28 +17,35 @@ import {
   Filter,
   ExternalLink,
   History,
+  HeartPulse,
   Image as ImageIcon,
   LogOut,
+  Languages,
   Map as MapIcon,
   MessageSquare,
   Navigation,
+  Newspaper,
   PanelLeftClose,
   PanelLeftOpen,
   Radio,
   RefreshCw,
   Search,
+  ScanSearch,
   Send,
   ShieldCheck,
   Siren,
   SlidersHorizontal,
   Users,
+  UserRoundSearch,
+  Gavel,
   Video,
   Volume2,
   X,
   Zap,
 } from "lucide-react";
 import { BeaconMark } from "@/components/BeaconMark";
-import { api, authHeaders, getApiBase } from "@/lib/api";
+import AuthorityLogin from "@/components/AuthorityLogin";
+import { api, authHeaders, clearAuthoritySession, getApiBase, getAuthoritySession, type AuthoritySession } from "@/lib/api";
 import { connectRealtime, type RealtimeState } from "@/lib/realtime";
 
 const MapCanvas = dynamic(() => import("@/components/MapCanvas"), {
@@ -59,9 +68,19 @@ type MediaEvidence = {
   secure_url?: string;
   path?: string;
   bytes?: number;
+  fallback_reason?: string;
+  transcript_original?: string;
+  detected_language?: string;
+  translation_en?: string;
+  transcription_provider?: string;
+  transcription_available?: boolean;
+  transcription_errors?: string[];
 };
 type Report = {
   id: string;
+  citizen_id?: string;
+  hazard_type?: string;
+  severity?: string;
   original_text: string;
   translated_text?: string;
   requested_help: string;
@@ -152,6 +171,14 @@ type Queue = {
   assignments: Assignment[];
   alerts: Alert[];
   delivery?: Delivery[];
+  communities?: Community[];
+  sms?: {
+    provider: string;
+    configured: boolean;
+    smtp_configured: boolean;
+    test_recipient_count: number;
+    max_message_chars: number;
+  };
 };
 type CommunityMessage = {
   id: string;
@@ -183,7 +210,7 @@ type AuditEvent = {
 };
 type View =
   | "Overview"
-  | "Incidents"
+  | "Reports"
   | "SOS desk"
   | "Communities"
   | "Broadcasts"
@@ -193,7 +220,7 @@ type Notice = { tone: "success" | "error" | "queued"; text: string } | null;
 
 const NAV: Array<{ icon: typeof MapIcon; label: View }> = [
   { icon: MapIcon, label: "Overview" },
-  { icon: Radio, label: "Incidents" },
+  { icon: FileWarning, label: "Reports" },
   { icon: Siren, label: "SOS desk" },
   { icon: Users, label: "Communities" },
   { icon: BellRing, label: "Broadcasts" },
@@ -248,6 +275,20 @@ function priorityReason(item: Incident) {
   return `${item.trust_state} · ${item.report_count} sources`;
 }
 
+function reportImpact(report?: Report) {
+  const text = `${report?.original_text || ""} ${report?.translated_text || ""}`.toLowerCase();
+  return {
+    injury: /\b(injur(?:ed|y|ies)|wound(?:ed|s)?|hurt)\b/.test(text),
+    fatality: /\b(died|dead|death|fatalit(?:y|ies)|killed)\b/.test(text),
+    affected: /\b(affected|trapped|stranded|displaced|evacuat(?:ed|ion))\b/.test(text),
+  };
+}
+
+function reporterLabel(report?: Report) {
+  if (!report) return "Citizen report";
+  return report.citizen_id ? `Citizen · ${report.citizen_id.slice(-6)}` : "Citizen report";
+}
+
 const SEVERITY_PRIORITY: Record<string, number> = {
   critical: 0,
   high: 1,
@@ -294,11 +335,16 @@ function evidenceUrl(item: MediaEvidence) {
 function EvidenceAsset({
   item,
   index,
+  reportId,
 }: {
   item: MediaEvidence;
   index: number;
+  reportId?: string;
 }) {
   const [failed, setFailed] = useState(false);
+  const [transcription, setTranscription] = useState<MediaEvidence>(item);
+  const [transcribing, setTranscribing] = useState(false);
+  const [transcriptionError, setTranscriptionError] = useState("");
   const url = evidenceUrl(item);
   const mime = item.content_type || item.mime_type || "";
   const kind =
@@ -344,14 +390,44 @@ function EvidenceAsset({
         />
       ) : kind === "audio" ? (
         <div className="audio-evidence">
-          <Volume2 />
-          <audio
-            src={url}
-            controls
-            preload="metadata"
-            aria-label={`Citizen evidence audio: ${name}`}
-            onError={() => setFailed(true)}
-          />
+          <div className="audio-player-row">
+            <Volume2 />
+            <audio
+              src={url}
+              controls
+              preload="metadata"
+              aria-label={`Citizen evidence audio: ${name}`}
+              onError={() => setFailed(true)}
+            />
+          </div>
+          <section className="audio-transcript" aria-label="Audio transcript and English translation">
+            <header><Languages /><b>Audio intelligence</b><span>{transcription.detected_language || "Language pending"}</span></header>
+            {transcription.transcription_available && transcription.translation_en ? (
+              <>
+                {transcription.transcript_original && transcription.transcript_original !== transcription.translation_en && (
+                  <div><small>Original transcript</small><p>{transcription.transcript_original}</p></div>
+                )}
+                <div className="english-transcript"><small>English translation</small><p>{transcription.translation_en}</p></div>
+                <footer><BrainCircuit /> {transcription.transcription_provider || "AI transcription"} · advisory transcript</footer>
+              </>
+            ) : (
+              <div className="transcript-pending">
+                <RefreshCw className={transcribing ? "spinning" : ""} />
+                <span><b>{transcribing ? "Transcribing audio…" : "English transcript not generated"}</b><small>{transcriptionError || "Use the configured Gemini/Groq audio pipeline."}</small></span>
+                {reportId && <button disabled={transcribing} onClick={async () => {
+                  setTranscribing(true);
+                  setTranscriptionError("");
+                  try {
+                    const result = await api<MediaEvidence>(`/authority/reports/${reportId}/media/${index}/transcribe`, { method: "POST" });
+                    setTranscription(result);
+                    if (!result.transcription_available) setTranscriptionError("AI providers could not transcribe this file. Audio remains retained.");
+                  } catch (error) {
+                    setTranscriptionError(error instanceof Error ? error.message : "Transcription failed");
+                  } finally { setTranscribing(false); }
+                }}><BrainCircuit /> Generate English transcript</button>}
+              </div>
+            )}
+          </section>
         </div>
       ) : (
         <a href={url} target="_blank" rel="noreferrer">
@@ -370,7 +446,7 @@ function EvidenceAsset({
           ) : (
             <FileWarning />
           )}
-          {name}
+          {name} · {item.provider === "cloudinary" ? "Cloudinary" : item.fallback_reason ? "Local fallback" : "Local storage"}
         </span>
         <a href={url} target="_blank" rel="noreferrer">
           Open original
@@ -433,6 +509,7 @@ function AssignmentLifecycle({
 }
 
 export default function Dashboard() {
+  const [session, setSession] = useState<AuthoritySession | null | undefined>(undefined);
   const [data, setData] = useState<Queue>({
     incidents: [],
     sos: [],
@@ -448,6 +525,7 @@ export default function Dashboard() {
     [selectedSos, setSelectedSos] = useState<string>(),
     [selectedCommunity, setSelectedCommunity] = useState<string>();
   const [navCollapsed, setNavCollapsed] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [connection, setConnection] = useState<RealtimeState>("connecting"),
     [loading, setLoading] = useState(true),
     [refreshing, setRefreshing] = useState(false),
@@ -480,7 +558,10 @@ export default function Dashboard() {
     }
     if (contextResult.status === "fulfilled")
       setFacilities(contextResult.value.facilities || []);
-    if (communityResult.status === "fulfilled") {
+    if (queueResult.status === "fulfilled" && queueResult.value.communities?.length) {
+      setCommunities(queueResult.value.communities);
+      setSelectedCommunity((v) => v || queueResult.value.communities?.[0]?.id);
+    } else if (communityResult.status === "fulfilled") {
       setCommunities(communityResult.value);
       setSelectedCommunity((v) => v || communityResult.value[0]?.id);
     }
@@ -496,10 +577,17 @@ export default function Dashboard() {
     setLoading(false);
     setRefreshing(false);
   }, []);
+  useEffect(() => setSession(getAuthoritySession()), []);
   useEffect(() => {
+    const expire = () => setSession(null);
+    window.addEventListener("beacon:authority-session-expired", expire);
+    return () => window.removeEventListener("beacon:authority-session-expired", expire);
+  }, []);
+  useEffect(() => {
+    if (!session) return;
     load();
-    return connectRealtime(() => load(true), setConnection);
-  }, [load]);
+    return connectRealtime(() => load(true), setConnection, session.token);
+  }, [load, session]);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(null), 5000);
@@ -602,6 +690,10 @@ export default function Dashboard() {
         ),
     [data.incidents, query, trustFilter],
   );
+  const notificationItems = useMemo(() => [
+    ...data.sos.map((item) => ({ id: item.id, kind: "sos" as const, title: "SOS assistance request", detail: item.note, created_at: item.created_at })),
+    ...data.incidents.flatMap((incident) => (incident.reports || []).map((report) => ({ id: incident.id, kind: "report" as const, title: incident.title, detail: `${incident.approximate_area} · ${incident.severity} priority`, created_at: report.created_at }))),
+  ].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()).slice(0, 8), [data]);
 
   async function mutate(
     path: string,
@@ -730,12 +822,12 @@ export default function Dashboard() {
     await mutate(
       "/communities",
       {
-        name: `${current.approximate_area} support group`,
+        name: `${current.hazard_type} · ${current.approximate_area}`,
         incident_id: current.id,
         radius_km: 2,
-        approved: true,
+        approved: false,
       },
-      "Incident community created for moderation",
+      "Community proposal created · authority approval required before app and Telegram visibility",
     );
   }
   async function postOfficialMessage(e: FormEvent<HTMLFormElement>) {
@@ -746,7 +838,7 @@ export default function Dashboard() {
       await mutate(
         `/communities/${currentCommunity.id}/messages`,
         {
-          sender_name: "Aditi Verma",
+          sender_name: "Vaibhav Sharma",
           sender_role: "admin",
           body: f.get("body"),
         },
@@ -754,6 +846,39 @@ export default function Dashboard() {
       )
     )
       e.currentTarget.reset();
+  }
+  async function sendAuthoritySms(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const form = e.currentTarget;
+    const fields = new FormData(form);
+    setBusy(true);
+    try {
+      const result = await api<{ status: string; detail: string }>(
+        "/authority/sms",
+        {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify({
+            title: fields.get("title"),
+            message: fields.get("message"),
+            incident_id: current?.id,
+          }),
+        },
+      );
+      setNotice({
+        tone: ["accepted", "delivered"].includes(result.status) ? "success" : "queued",
+        text: result.detail,
+      });
+      form.reset();
+      await load(true);
+    } catch (error) {
+      setNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : "SMS could not be queued.",
+      });
+    } finally {
+      setBusy(false);
+    }
   }
   async function submitModeration(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -772,6 +897,12 @@ export default function Dashboard() {
     )
       setModeration(null);
   }
+
+  if (session === undefined) return <div className="authority-auth-boot" aria-label="Loading secure authority session"><span /></div>;
+  if (!session) return <AuthorityLogin onAuthenticated={(nextSession) => {
+    setView(nextSession.user.role === "responder" ? "SOS desk" : "Overview");
+    setSession(nextSession);
+  }} />;
 
   const connectionText =
     connection === "live"
@@ -821,12 +952,7 @@ export default function Dashboard() {
             <span>Demo guide</span>
           </button>
           <button
-            onClick={() =>
-              setNotice({
-                tone: "queued",
-                text: "Local prototype session remains active",
-              })
-            }
+            onClick={() => { clearAuthoritySession(); setSession(null); }}
           >
             <LogOut />
             <span>Sign out</span>
@@ -834,7 +960,7 @@ export default function Dashboard() {
           <div className="operator">
             <span>AV</span>
             <p>
-              Aditi Verma<small>District admin</small>
+              {session.user.name}<small>{session.user.role} · {session.user.jurisdiction}</small>
             </p>
           </div>
         </div>
@@ -873,11 +999,28 @@ export default function Dashboard() {
             </a>
             <button
               className="notification-button"
-              aria-label={`${data.sos.length} open SOS requests`}
+              aria-label={`${notificationItems.length} recent operational notifications`}
+              aria-expanded={notificationsOpen}
+              onClick={() => setNotificationsOpen((value) => !value)}
             >
               <BellRing />
-              <b>{data.sos.length}</b>
+              <b>{notificationItems.length}</b>
             </button>
+            {notificationsOpen && (
+              <section className="notification-popover" aria-label="Latest reports and SOS requests">
+                <header><div><strong>Latest signals</strong><span>Live reports and emergency requests</span></div><button onClick={() => setNotificationsOpen(false)} aria-label="Close notifications"><X /></button></header>
+                <div>
+                  {notificationItems.map((item) => (
+                    <button key={`${item.kind}-${item.id}-${item.created_at}`} onClick={() => { item.kind === "sos" ? focusSos(item.id) : focusIncident(item.id); setView(item.kind === "sos" ? "SOS desk" : "Reports"); setNotificationsOpen(false); }}>
+                      <span className={item.kind}><>{item.kind === "sos" ? <Siren /> : <FileWarning />}</></span>
+                      <span><b>{item.title}</b><small>{item.detail}</small></span>
+                      <time>{age(item.created_at)}</time>
+                    </button>
+                  ))}
+                  {!notificationItems.length && <p>No new reports or SOS requests.</p>}
+                </div>
+              </section>
+            )}
           </div>
         </header>
         {error && (
@@ -943,6 +1086,7 @@ export default function Dashboard() {
             onSelectCommunity={setSelectedCommunity}
             onCreateCommunity={createCommunity}
             onPostMessage={postOfficialMessage}
+            onSendSms={sendAuthoritySms}
             onPublish={publish}
             onDecision={decide}
             onSourceCheck={refreshSourceCheck}
@@ -982,7 +1126,7 @@ export default function Dashboard() {
             <div className="audit-preview">
               <History />
               <span>
-                <b>Aditi Verma · District admin</b>
+                <b>Vaibhav Sharma · District admin</b>
                 <small>
                   {current.title} · reason required · timestamp recorded
                 </small>
@@ -1182,6 +1326,7 @@ function IncidentReviewFlow({
       label: "Evidence received",
       detail: `${incident.report_count} citizen submission${incident.report_count === 1 ? "" : "s"}`,
       state: "complete",
+      icon: FileWarning,
     },
     {
       label: "Language normalized",
@@ -1189,11 +1334,13 @@ function IncidentReviewFlow({
         ? translation.provider
         : "Original safely retained",
       state: translation?.available ? "complete" : "limited",
+      icon: Languages,
     },
     {
       label: "AI screening",
       detail: incident.analysis?.provider || "Analysis pending",
       state: incident.analysis ? "complete" : "waiting",
+      icon: BrainCircuit,
     },
     {
       label: "Sources checked",
@@ -1205,11 +1352,47 @@ function IncidentReviewFlow({
           ? "complete"
           : "limited"
         : "waiting",
+      icon: ScanSearch,
     },
     {
       label: "Authority decision",
       detail: decided ? incident.trust_state : "Human review required",
       state: decided ? "complete" : "waiting",
+      icon: Gavel,
+    },
+  ];
+  const correspondence = [
+    {
+      label: "Published fact-checks",
+      icon: ShieldCheck,
+      value: googleChecked
+        ? `${factCheckSources.length} matching review${factCheckSources.length === 1 ? "" : "s"}`
+        : googleUnavailable
+          ? "API key not configured"
+          : googleError
+            ? "Check temporarily unavailable"
+            : verification
+              ? "No matching review"
+              : "Waiting to run",
+    },
+    {
+      label: "Related reporting",
+      icon: Newspaper,
+      value: gdeltError
+        ? "Search temporarily unavailable"
+        : verification
+          ? `${newsSources.length} linked article${newsSources.length === 1 ? "" : "s"}`
+          : "Waiting to run",
+    },
+    {
+      label: "Last checked",
+      icon: RefreshCw,
+      value: verification ? age(verification.checked_at) : "Not yet checked",
+    },
+    {
+      label: "Decision owner",
+      icon: UserRoundSearch,
+      value: decided ? incident.trust_state : "Authorized official",
     },
   ];
 
@@ -1233,12 +1416,17 @@ function IncidentReviewFlow({
         {stages.map((stage, index) => (
           <li key={stage.label} data-state={stage.state}>
             <span className="stage-mark" aria-hidden="true">
-              {stage.state === "complete" ? <CheckCircle2 /> : stage.state === "limited" ? <CircleAlert /> : <span>{index + 1}</span>}
+              <stage.icon />
             </span>
-            <div>
+            <div className="stage-copy">
+              <span className="stage-order">Stage {index + 1}</span>
               <b>{stage.label}</b>
               <small>{stage.detail}</small>
             </div>
+            <span className="stage-status">
+              {stage.state === "complete" ? <CheckCircle2 /> : stage.state === "limited" ? <CircleAlert /> : <RefreshCw />}
+              {stage.state === "complete" ? "Complete" : stage.state === "limited" ? "Limited" : "Waiting"}
+            </span>
           </li>
         ))}
       </ol>
@@ -1258,32 +1446,12 @@ function IncidentReviewFlow({
           </div>
         </div>
         <dl className="correspondence-grid">
-          <div>
-            <dt>Published fact-checks</dt>
-            <dd>
-              {googleChecked
-                ? `${factCheckSources.length} matching review${factCheckSources.length === 1 ? "" : "s"}`
-                : googleUnavailable
-                  ? "API key not configured"
-                  : googleError
-                    ? "Check temporarily unavailable"
-                  : verification
-                    ? "No matching review"
-                    : "Waiting"}
-            </dd>
-          </div>
-          <div>
-            <dt>Related reporting</dt>
-            <dd>{gdeltError ? "Search temporarily unavailable" : verification ? `${newsSources.length} linked article${newsSources.length === 1 ? "" : "s"}` : "Waiting"}</dd>
-          </div>
-          <div>
-            <dt>Last checked</dt>
-            <dd>{verification ? age(verification.checked_at) : "Not yet checked"}</dd>
-          </div>
-          <div>
-            <dt>Decision owner</dt>
-            <dd>{decided ? incident.trust_state : "Authorized official"}</dd>
-          </div>
+          {correspondence.map((item) => (
+            <div key={item.label}>
+              <span className="correspondence-icon" aria-hidden="true"><item.icon /></span>
+              <div><dt>{item.label}</dt><dd>{item.value}</dd></div>
+            </div>
+          ))}
         </dl>
         {verification?.sources.length ? (
           <ul className="verification-sources">
@@ -1376,9 +1544,32 @@ function Overview({
     return mapLayer !== "sos";
   });
   const mapSos = mapLayer === "all" || mapLayer === "sos" ? data.sos : [];
+  const allReports = data.incidents.flatMap((incident) => incident.reports || []);
+  const impact = allReports.reduce((totals, report) => {
+    const found = reportImpact(report);
+    totals.affected += Number(found.affected);
+    totals.injury += Number(found.injury);
+    totals.fatality += Number(found.fatality);
+    return totals;
+  }, { affected: 0, injury: 0, fatality: 0 });
+  const trend = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date();
+    date.setHours(0, 0, 0, 0);
+    date.setDate(date.getDate() - (6 - index));
+    const next = new Date(date);
+    next.setDate(next.getDate() + 1);
+    return { label: date.toLocaleDateString("en-IN", { weekday: "short" }), count: allReports.filter((report) => { const stamp = new Date(report.created_at).getTime(); return stamp >= date.getTime() && stamp < next.getTime(); }).length };
+  });
+  const trendMax = Math.max(1, ...trend.map((day) => day.count));
   return (
     <>
-      <div className="operations-bar">
+      <section className="operations-bar impact-overview" aria-label="Reported impact overview">
+        <div className="impact-intro"><span>Operational picture</span><strong>{data.sos.length ? "Active response" : "District monitoring"}</strong><small>Citizen-reported data · human verification required</small></div>
+        <div className="impact-metric affected"><UserRoundSearch /><span>Affected mentions</span><strong>{impact.affected || "Not reported"}</strong></div>
+        <div className="impact-metric injured"><HeartPulse /><span>Injury mentions</span><strong>{impact.injury || "Not reported"}</strong></div>
+        <div className="impact-metric fatalities"><CircleAlert /><span>Fatality mentions</span><strong>{impact.fatality || "Not reported"}</strong></div>
+        <div className="impact-metric help"><Siren /><span>Awaiting help</span><strong>{data.sos.filter((item) => !["Closed", "Cancelled"].includes(item.status)).length}</strong></div>
+        <figure className="impact-trend" aria-label="Report volume over the last seven days"><figcaption><span><BarChart3 /> Report volume</span><b>{allReports.length} total</b></figcaption><div>{trend.map((day) => <span key={day.label} title={`${day.label}: ${day.count} reports`}><i style={{ height: `${Math.max(7, (day.count / trendMax) * 42)}px` }} /><small>{day.label}</small></span>)}</div></figure>
         <div>
           <span>Posture</span>
           <strong>{data.sos.length ? "Active response" : "Monitoring"}</strong>
@@ -1414,7 +1605,7 @@ function Overview({
           <CloudRain />
           Open-Meteo context <span>·</span> {facilities.length} facilities
         </p>
-      </div>
+      </section>
       <div className="watch-grid">
         <div className="map-and-evidence">
           <section className="map-panel">
@@ -1442,7 +1633,12 @@ function Overview({
               </div>
             </div>
             <MapCanvas
-              incidents={mapIncidents}
+              incidents={mapIncidents.map((incident) => ({
+                ...incident,
+                injured_mentions: (incident.reports || []).filter((report) => reportImpact(report).injury).length,
+                help_status: data.assignments.find((item) => item.incident_id === incident.id)?.status || incident.status,
+                reported_by: reporterLabel(incident.reports?.[0]),
+              }))}
               facilities={facilities}
               sos={mapSos}
               selectedId={current?.id}
@@ -1571,6 +1767,7 @@ function Overview({
                                 key={`${item.url || item.path || item.name || "evidence"}-${index}`}
                                 item={item}
                                 index={index}
+                                reportId={current.reports?.[0]?.id}
                               />
                             ),
                           )}
@@ -1826,6 +2023,7 @@ function Overview({
 
 function InlineIncidentDetail({
   incident,
+  report: selectedReport,
   facilities,
   assignment,
   busy,
@@ -1837,6 +2035,7 @@ function InlineIncidentDetail({
   onPublish,
 }: {
   incident?: Incident;
+  report?: Report;
   facilities: any[];
   assignment?: Assignment;
   busy: boolean;
@@ -1857,12 +2056,27 @@ function InlineIncidentDetail({
     );
   }
 
-  const report = incident.reports?.[0];
+  const report = selectedReport || incident.reports?.[0];
   const media = reportMedia(report);
+  const ticketDate = report?.created_at || incident.created_at;
+  const ticketNumber = `TKT-${(report?.id || incident.id).toUpperCase()}`;
   return (
     <section className="incident-inline-detail" aria-live="polite">
       <header className="incident-detail-head">
-        <div>
+        <div className="incident-ticket-identity">
+          <span className="incident-ticket-number">{ticketNumber}</span>
+          <time dateTime={ticketDate}>
+            {new Date(ticketDate).toLocaleString("en-IN", {
+              day: "2-digit",
+              month: "short",
+              year: "numeric",
+              hour: "2-digit",
+              minute: "2-digit",
+            })}
+          </time>
+          <span>Received {age(ticketDate)}</span>
+        </div>
+        <div className="incident-detail-title">
           <div className="incident-detail-state">
             <StateBadge state={incident.trust_state} />
             <span className={`severity severity-${incident.severity}`}>
@@ -1875,7 +2089,6 @@ function InlineIncidentDetail({
             {incident.approximate_area} · received {age(incident.created_at)} · {incident.report_count} source{incident.report_count === 1 ? "" : "s"}
           </p>
         </div>
-        <span className="incident-reference">{incident.id}</span>
       </header>
 
       <div className="incident-location-grid">
@@ -1941,6 +2154,7 @@ function InlineIncidentDetail({
                     key={`${item.url || item.path || item.name || "evidence"}-${index}`}
                     item={item}
                     index={index}
+                    reportId={report?.id}
                   />
                 ))}
               </div>
@@ -2041,6 +2255,7 @@ function UtilityWorkspace({
   onSelectCommunity,
   onCreateCommunity,
   onPostMessage,
+  onSendSms,
   onPublish,
   onDecision,
   onSourceCheck,
@@ -2067,6 +2282,7 @@ function UtilityWorkspace({
   onSelectCommunity: (id: string) => void;
   onCreateCommunity: () => void;
   onPostMessage: (e: FormEvent<HTMLFormElement>) => void;
+  onSendSms: (e: FormEvent<HTMLFormElement>) => void;
   onPublish: () => void;
   onDecision: (action: string) => void;
   onSourceCheck: () => void;
@@ -2078,8 +2294,28 @@ function UtilityWorkspace({
     action: string;
   }) => void;
 }) {
+  const [reportStatus, setReportStatus] = useState("All");
+  const [reportCategory, setReportCategory] = useState("All");
+  const [reportPriority, setReportPriority] = useState("All");
+  const [selectedReportTicket, setSelectedReportTicket] = useState<string>();
+  useEffect(() => {
+    if (view !== "Reports") setSelectedReportTicket(undefined);
+  }, [view]);
+  const reportIncidents = incidents.filter((incident) =>
+    (reportStatus === "All" || incident.trust_state === reportStatus) &&
+    (reportCategory === "All" || incident.hazard_type === reportCategory) &&
+    (reportPriority === "All" || incident.severity === reportPriority.toLowerCase()),
+  );
+  const reportTickets: Array<{ incident: Incident; report?: Report }> = reportIncidents.flatMap<{ incident: Incident; report?: Report }>((incident) =>
+    incident.reports?.length
+      ? incident.reports.map((report) => ({ incident, report }))
+      : [{ incident, report: undefined }],
+  ).sort((a, b) => new Date(b.report?.created_at || b.incident.created_at).getTime() - new Date(a.report?.created_at || a.incident.created_at).getTime());
+  const openedTicket = reportTickets.find(
+    ({ incident, report }) => (report?.id || incident.id) === selectedReportTicket,
+  );
   const descriptions: Record<string, string> = {
-    Incidents: "Review trust, evidence volume and field response.",
+    Reports: "Review citizen tickets, evidence, priority and field response.",
     "SOS desk": "Move every emergency through an auditable response lifecycle.",
     Communities:
       "Moderate local rooms while keeping official guidance distinct.",
@@ -2109,46 +2345,48 @@ function UtilityWorkspace({
         </div>
       ) : (
         <>
-          {view === "Incidents" && (
-            <div className="incident-workbench">
+          {view === "Reports" && (
+            <div className="reports-surface">
+              <div className="report-ticket-header">
+                <div><h3>Submitted reports</h3><p>{reportTickets.length} ticket{reportTickets.length === 1 ? "" : "s"} · newest first</p></div>
+                <label>Status<select value={reportStatus} onChange={(event) => setReportStatus(event.target.value)}><option>All</option><option>Unverified</option><option>Corroborated</option><option>Verified</option><option>Misleading</option><option>Outdated</option></select></label>
+                <label>Category<select value={reportCategory} onChange={(event) => setReportCategory(event.target.value)}><option>All</option>{[...new Set(incidents.map((item) => item.hazard_type))].map((value) => <option key={value}>{value}</option>)}</select></label>
+                <label>Priority<select value={reportPriority} onChange={(event) => setReportPriority(event.target.value)}><option>All</option><option>Critical</option><option>High</option><option>Moderate</option><option>Low</option></select></label>
+              </div>
+              <div className="incident-workbench report-ticket-workbench">
               <aside className="incident-index" aria-label="Incident list">
                 <div className="incident-index-head">
                   <div>
-                    <h3>Incident queue</h3>
-                    <p>{incidents.length} signals in the current filter</p>
+                    <h3>Ticket queue</h3>
+                    <p>{reportTickets.length} reports in the current filter</p>
                   </div>
                 </div>
                 <div className="incident-index-list">
-                  {incidents.map((incident) => {
-                    const assignment = data.assignments.find(
-                      (item) => item.incident_id === incident.id,
-                    );
+                  {reportTickets.map(({ incident, report }) => {
+                    const ticketKey = report?.id || incident.id;
                     return (
                       <button
-                        key={incident.id}
-                        className={current?.id === incident.id ? "active" : ""}
-                        aria-pressed={current?.id === incident.id}
-                        onClick={() => onIncident(incident.id)}
+                        key={ticketKey}
+                        className={selectedReportTicket === ticketKey ? "active" : ""}
+                        aria-pressed={selectedReportTicket === ticketKey}
+                        onClick={() => {
+                          setSelectedReportTicket(ticketKey);
+                          onIncident(incident.id);
+                        }}
                       >
                         <span className="incident-index-meta">
-                          <StateBadge state={incident.trust_state} />
-                          <time>{age(incident.created_at)}</time>
+                          <small className="ticket-id">TKT-{ticketKey.toUpperCase()}</small>
+                          <time>{age(report?.created_at || incident.created_at)}</time>
                         </span>
                         <strong>{incident.title}</strong>
-                        <small>
-                          <MapIcon /> {incident.approximate_area}
-                        </small>
-                        <span className="incident-index-foot">
-                          <em className={`severity severity-${incident.severity}`}>
-                            {incident.severity}
-                          </em>
-                          <span>{incident.report_count} sources</span>
-                          {assignment && <StateBadge state={assignment.status} />}
+                        <span className="ticket-summary-state">
+                          <em className={`severity severity-${incident.severity}`}>{incident.severity}</em>
+                          <StateBadge state={incident.trust_state} />
                         </span>
                       </button>
                     );
                   })}
-                  {!incidents.length && (
+                  {!reportTickets.length && (
                     <WorkspaceEmpty
                       icon={Radio}
                       title="No matching incidents"
@@ -2157,20 +2395,24 @@ function UtilityWorkspace({
                   )}
                 </div>
               </aside>
-              <InlineIncidentDetail
-                incident={current}
-                facilities={facilities}
-                assignment={data.assignments.find(
-                  (item) => item.incident_id === current?.id,
-                )}
-                busy={busy}
-                onAssign={onAssign}
-                onAssignmentStatus={onAssignmentStatus}
-                onDecision={onDecision}
-                onSourceCheck={onSourceCheck}
-                onBypass={onBypass}
-                onPublish={onPublish}
-              />
+              {openedTicket && (
+                <InlineIncidentDetail
+                  incident={openedTicket.incident}
+                  report={openedTicket.report}
+                  facilities={facilities}
+                  assignment={data.assignments.find(
+                    (item) => item.incident_id === openedTicket.incident.id,
+                  )}
+                  busy={busy}
+                  onAssign={onAssign}
+                  onAssignmentStatus={onAssignmentStatus}
+                  onDecision={onDecision}
+                  onSourceCheck={onSourceCheck}
+                  onBypass={onBypass}
+                  onPublish={onPublish}
+                />
+              )}
+              </div>
             </div>
           )}
           {view === "SOS desk" && (
@@ -2242,6 +2484,16 @@ function UtilityWorkspace({
                   >
                     New room
                   </button>
+                </div>
+                <div className="community-area-picker">
+                  <div className="community-map-shell">
+                    <MapCanvas incidents={incidents} facilities={facilities} selectedId={current?.id} onSelect={onIncident} />
+                  </div>
+                  <div className="community-proposal-copy">
+                    <span>Select an incident area</span>
+                    <strong>{current ? `${current.hazard_type} · ${current.approximate_area}` : "Choose a circle on the map"}</strong>
+                    <small>{current ? `2 km moderated room · ${current.report_count} source${current.report_count === 1 ? "" : "s"}` : "A proposed room remains private until final authority approval."}</small>
+                  </div>
                 </div>
                 <div className="community-list">
                   {communities.map((c) => (
@@ -2476,34 +2728,78 @@ function UtilityWorkspace({
             </div>
           )}
           {view === "Delivery" && (
-            <div className="table-shell">
-              <div className="data-table delivery-table">
-                <div className="table-head">
-                  <span>Message</span>
-                  <span>Channel</span>
-                  <span>Outcome</span>
-                  <span>Detail</span>
-                  <span>Attempted</span>
-                </div>
-                {(data.delivery || []).map((a) => (
-                  <div className="table-row" key={a.id}>
+            <div className="delivery-workspace">
+              <form className="sms-console" onSubmit={onSendSms}>
+                <header>
+                  <div>
+                    <MessageSquare />
                     <span>
-                      <b>{a.entity_type}</b>
-                      <small>{a.entity_id}</small>
+                      <h3>Send SMS update</h3>
+                      <p>Audited Textbelt message · approved recipients only</p>
                     </span>
-                    <span>{a.channel}</span>
-                    <StateBadge state={a.status} />
-                    <p>{a.detail}</p>
-                    <time>{new Date(a.created_at).toLocaleString()}</time>
                   </div>
-                ))}
-                {!data.delivery?.length && (
-                  <WorkspaceEmpty
-                    icon={Send}
-                    title="No delivery attempts"
-                    body="Publish or correct an alert to exercise fallback delivery."
+                  <StateBadge state={data.sms?.configured ? "Ready" : "Store-and-forward"} />
+                </header>
+                <label>
+                  Message title
+                  <input
+                    name="title"
+                    maxLength={80}
+                    required
+                    defaultValue={current ? `BEACON: ${current.hazard_type} update` : "BEACON safety update"}
                   />
-                )}
+                </label>
+                <label>
+                  Safety message
+                  <textarea
+                    name="message"
+                    minLength={8}
+                    maxLength={280}
+                    required
+                    placeholder="Write a concise instruction with area, action and official source."
+                  />
+                </label>
+                <div className="sms-console-foot">
+                  <span>
+                    {data.sms?.configured
+                      ? `${data.sms.test_recipient_count} approved recipient${data.sms.test_recipient_count === 1 ? "" : "s"} · Textbelt ${data.sms.smtp_configured ? "SMTP ready" : "needs SMTP"}`
+                      : "Add TEXTBELT_TEST_RECIPIENTS and SMTP settings · submissions remain safely queued until then"}
+                  </span>
+                  <button disabled={busy}>
+                    <Send />
+                    {busy ? "Sending…" : data.sms?.configured ? "Send SMS" : "Queue SMS"}
+                  </button>
+                </div>
+              </form>
+              <div className="table-shell delivery-ledger-shell">
+                <div className="data-table delivery-table">
+                  <div className="table-head">
+                    <span>Message</span>
+                    <span>Channel</span>
+                    <span>Outcome</span>
+                    <span>Detail</span>
+                    <span>Attempted</span>
+                  </div>
+                  {(data.delivery || []).map((a) => (
+                    <div className="table-row" key={a.id}>
+                      <span>
+                        <b>{a.entity_type.replaceAll("_", " ")}</b>
+                        <small>{a.entity_id}</small>
+                      </span>
+                      <span>{a.channel}</span>
+                      <StateBadge state={a.status} />
+                      <p>{a.detail}</p>
+                      <time>{new Date(a.created_at).toLocaleString()}</time>
+                    </div>
+                  ))}
+                  {!data.delivery?.length && (
+                    <WorkspaceEmpty
+                      icon={Send}
+                      title="No delivery attempts"
+                      body="Send a test SMS or publish an official alert to begin the ledger."
+                    />
+                  )}
+                </div>
               </div>
             </div>
           )}

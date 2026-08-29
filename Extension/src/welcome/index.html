@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BEACON Lens</title>
+    <style>
+      :root {
+        --brand-teal: #007f8b;
+        --brand-accent: #a87500;
+        --surface-bg: #111820;
+        --surface-elevated: #182229;
+        --text-primary: #f7faf9;
+        --text-muted: #aeb8bc;
+        --border-color: #344249;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--surface-bg);
+        color: var(--text-primary);
+        font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+      }
+
+      body {
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        padding: 64px 24px;
+      }
+
+      main {
+        max-width: 420px;
+        width: 100%;
+        text-align: center;
+      }
+
+      .logo {
+        width: 56px;
+        height: 56px;
+        border-radius: 16px;
+        margin: 0 auto 20px;
+        display: block;
+      }
+
+      h1 {
+        font-size: 24px;
+        font-weight: 700;
+        margin: 0 0 8px;
+      }
+
+      p.subtitle {
+        font-size: 14px;
+        color: var(--text-muted);
+        margin: 0 0 32px;
+        line-height: 1.5;
+      }
+
+      .card {
+        background: var(--surface-elevated);
+        border: 1px solid var(--border-color);
+        border-radius: 16px;
+        padding: 24px;
+        text-align: left;
+      }
+
+      .card p {
+        font-size: 14px;
+        line-height: 1.6;
+        margin: 0 0 16px;
+      }
+
+      .card p:last-child {
+        margin-bottom: 0;
+      }
+
+      .step {
+        display: flex;
+        gap: 12px;
+        align-items: flex-start;
+      }
+
+      .step-num {
+        flex-shrink: 0;
+        width: 22px;
+        height: 22px;
+        border-radius: 999px;
+        background: var(--brand-teal);
+        color: white;
+        font-size: 12px;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .puzzle-hint {
+        margin-top: 28px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        font-size: 13px;
+        color: var(--text-muted);
+      }
+
+      .puzzle-icon {
+        font-size: 15px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <img class="logo" src="../../icons/beacon-logo.png" alt="BEACON Lens" />
+      <h1 data-i18n="title">BEACON Lens installed</h1>
+      <p class="subtitle" data-i18n="subtitle">
+        Pin the extension for one-click access to live translation and evidence checks.
+      </p>
+
+      <div class="card">
+        <div class="step">
+          <span class="step-num">1</span>
+          <p>
+            <span data-i18n="step1a">Click the puzzle piece icon</span>
+            <span class="puzzle-icon" aria-hidden="true">🧩</span>
+            <span data-i18n="step1b">in Chrome's address bar.</span>
+          </p>
+        </div>
+        <div class="step" style="margin-top: 16px;">
+          <span class="step-num">2</span>
+          <p data-i18n="step2">Find BEACON Lens and click the pin to keep it visible.</p>
+        </div>
+      </div>
+
+      <p class="puzzle-hint" data-i18n="hint">↑ It is at the top right, beside the address bar.</p>
+    </main>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

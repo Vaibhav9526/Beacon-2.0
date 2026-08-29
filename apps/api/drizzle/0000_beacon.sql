@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS communities (id text PRIMARY KEY, name text NOT NULL,
 ALTER TABLE communities ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'proposed';
 CREATE TABLE IF NOT EXISTS messages (id text PRIMARY KEY, community_id text NOT NULL REFERENCES communities(id), sender_name text NOT NULL, sender_role text NOT NULL, body text NOT NULL, official boolean NOT NULL DEFAULT false, created_at timestamptz NOT NULL DEFAULT now());
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS moderation_status text NOT NULL DEFAULT 'visible';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS source_language text NOT NULL DEFAULT 'en';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS translations jsonb NOT NULL DEFAULT '{}';
 CREATE TABLE IF NOT EXISTS alerts (id text PRIMARY KEY, incident_id text REFERENCES incidents(id), title text NOT NULL, body text NOT NULL, severity text NOT NULL, status text NOT NULL DEFAULT 'active', superseded_by text, published_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz);
 CREATE TABLE IF NOT EXISTS corrections (id text PRIMARY KEY, alert_id text NOT NULL REFERENCES alerts(id), replacement_alert_id text NOT NULL, reason text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS audit_events (id text PRIMARY KEY, actor_id text NOT NULL, action text NOT NULL, entity_type text NOT NULL, entity_id text NOT NULL, reason text, detail jsonb NOT NULL DEFAULT '{}', created_at timestamptz NOT NULL DEFAULT now());

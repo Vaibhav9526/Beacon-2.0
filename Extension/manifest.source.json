@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "BEACON",
+  "version": "1.1.9",
+  "minimum_chrome_version": "141",
+  "description": "Fast in-browser Whisper translation with screenshot-based misinformation checks.",
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "permissions": [
+    "tabCapture",
+    "offscreen",
+    "storage",
+    "unlimitedStorage",
+    "activeTab",
+    "sidePanel",
+    "scripting",
+    "tabs"
+  ],
+  "background": {
+    "service_worker": "src/background/index.ts",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "src/popup/index.html"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icons/beacon-logo.png",
+      "48": "icons/beacon-logo.png",
+      "128": "icons/beacon-logo.png"
+    }
+  },
+  "icons": {
+    "16": "icons/beacon-logo.png",
+    "48": "icons/beacon-logo.png",
+    "128": "icons/beacon-logo.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
+  }
+}

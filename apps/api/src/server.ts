@@ -13,11 +13,12 @@ import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypt
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as s from "./schema.js";
-import { analyzeReport, redactPII } from "./ai.js";
+import { analyzeExtensionScreenshot, analyzeReport, redactPII, transcribeAudio, translateForExtension } from "./ai.js";
 import { config, serviceReadiness } from "./config.js";
 import { readLocalMedia, storeMedia } from "./media.js";
 import { INDIAN_LANGUAGES, translateText } from "./translation.js";
 import { verifyClaim } from "./verification.js";
+import { z } from "zod";
 
 const EVENT_CHANNEL = "beacon:events";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -30,6 +31,34 @@ const app = Fastify({ logger: { level: process.env.LOG_LEVEL || "info", redact: 
 type Principal = { kind: "official"; id: string; role: "admin" | "responder" } | { kind: "citizen"; id: string };
 type Audience = { kind: "authority" } | { kind: "authenticated" } | { kind: "citizen"; citizenId: string };
 const sockets = new Map<any, Principal>();
+const supportedLanguageCodes = new Set(INDIAN_LANGUAGES.map((item) => item.code));
+
+const coordinateSchema = z.object({
+  latitude: z.coerce.number().finite().min(-90).max(90),
+  longitude: z.coerce.number().finite().min(-180).max(180),
+});
+const citizenSessionSchema = z.object({
+  name: z.string().trim().min(2).max(100),
+  phone: z.string().transform((value) => value.replace(/\D/g, "")).pipe(z.string().min(8).max(15)),
+  language: z.string().trim().min(2).max(8).refine((value) => supportedLanguageCodes.has(value as any), "Unsupported language code").default("en"),
+  device_id: z.string().trim().min(8).max(160),
+});
+const reportFieldsSchema = coordinateSchema.extend({
+  citizen_id: z.string().trim().min(4).max(100),
+  hazard_type: z.string().trim().min(2).max(60),
+  severity: z.enum(["low", "moderate", "high", "critical"]),
+  text: z.string().trim().min(3).max(4_000),
+  requested_help: z.string().trim().max(500).default(""),
+  language: z.string().trim().min(2).max(8).optional(),
+});
+const sosSchema = coordinateSchema.extend({
+  citizen_id: z.string().trim().min(4).max(100),
+  note: z.string().trim().max(500).default("Emergency assistance requested"),
+});
+const communityMessageSchema = z.object({
+  body: z.string().trim().min(1).max(1_000),
+  source_language: z.string().trim().min(2).max(8).refine((value) => supportedLanguageCodes.has(value as any), "Unsupported language code").optional(),
+});
 
 const id = (prefix: string) => `${prefix}_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
 const publicArea = (lat: number, lon: number) => `Ward area near ${lat.toFixed(2)}, ${lon.toFixed(2)}`;
@@ -39,6 +68,12 @@ const snake = (value: any): any => {
   return value;
 };
 const safeError = (reply: FastifyReply, code: number, detail: string) => reply.code(code).send({ detail });
+const parseBody = <T>(schema: z.ZodType<T>, value: unknown, reply: FastifyReply): T | null => {
+  const result = schema.safeParse(value);
+  if (result.success) return result.data;
+  safeError(reply, 400, result.error.issues[0]?.message || "Invalid request payload");
+  return null;
+};
 const hashPassword = (password: string) => { const salt = randomBytes(16).toString("hex"); return `scrypt$${salt}$${scryptSync(password, salt, 32).toString("hex")}`; };
 const verifyPassword = (password: string, stored: string) => {
   if (!stored.startsWith("scrypt$")) return stored === password;
@@ -54,12 +89,20 @@ async function ensureSchema() {
 
 async function seed() {
   const demoOfficials = [
-    { id: "official_admin", name: "Aditi Verma", email: "admin@beacon.local", password: "BeaconDemo!26", role: "admin" as const, organization: "Raipur District Control", jurisdiction: "Raipur", mfaReady: true },
+    { id: "official_admin", name: "Vaibhav Sharma", email: "admin@beacon.local", password: "BeaconDemo!26", role: "admin" as const, organization: "Raipur District Control", jurisdiction: "Raipur", mfaReady: true },
     { id: "official_responder", name: "Ravi Sahu", email: "responder@beacon.local", password: "ResponderDemo!26", role: "responder" as const, organization: "NDRF Demo Unit", jurisdiction: "Raipur", mfaReady: true },
   ];
   await db.insert(s.officialUsers).values(demoOfficials.map((user) => ({ ...user, password: hashPassword(user.password) }))).onConflictDoNothing();
   for (const demo of demoOfficials) {
     const [stored] = await db.select({ password: s.officialUsers.password }).from(s.officialUsers).where(eq(s.officialUsers.id, demo.id)).limit(1);
+    await db.update(s.officialUsers).set({
+      name: demo.name,
+      email: demo.email,
+      role: demo.role,
+      organization: demo.organization,
+      jurisdiction: demo.jurisdiction,
+      mfaReady: demo.mfaReady,
+    }).where(eq(s.officialUsers.id, demo.id));
     if (stored && !stored.password.startsWith("scrypt$")) await db.update(s.officialUsers).set({ password: hashPassword(demo.password) }).where(eq(s.officialUsers.id, demo.id));
   }
   await db.insert(s.facilities).values([
@@ -114,6 +157,45 @@ async function requireCitizen(request: FastifyRequest, reply: FastifyReply, citi
   return true;
 }
 
+type CachedMessageTranslation = {
+  text: string;
+  provider: string;
+  translated_at: string;
+};
+
+async function localizeCommunityMessage(message: typeof s.messages.$inferSelect, targetLanguage: string) {
+  const { translations: storedTranslations, ...publicMessage } = message;
+  const sourceLanguage = supportedLanguageCodes.has(message.sourceLanguage as any) ? message.sourceLanguage : "en";
+  if (sourceLanguage === targetLanguage) {
+    return { ...publicMessage, body: message.body, originalBody: message.body, sourceLanguage, displayLanguage: sourceLanguage, translated: false, translationAvailable: true, translationProvider: "original" };
+  }
+
+  const translations = (storedTranslations && typeof storedTranslations === "object" ? storedTranslations : {}) as Record<string, CachedMessageTranslation>;
+  const cached = translations[targetLanguage];
+  if (cached?.text) {
+    return { ...publicMessage, body: cached.text, originalBody: message.body, sourceLanguage, displayLanguage: targetLanguage, translated: true, translationAvailable: true, translationProvider: cached.provider };
+  }
+
+  const failureKey = `translation-failure:${message.id}:${targetLanguage}`;
+  const recentFailure = await redis.get(failureKey);
+  if (recentFailure) {
+    const failure = JSON.parse(recentFailure) as { provider?: string };
+    return { ...publicMessage, body: message.body, originalBody: message.body, sourceLanguage, displayLanguage: sourceLanguage, requestedLanguage: targetLanguage, translated: false, translationAvailable: false, translationProvider: failure.provider || "unavailable" };
+  }
+
+  // Cloud providers never receive the sender's name, phone number, email, or coordinates.
+  const safeText = redactPII(message.body, [message.senderName]).text;
+  const result = await translateText(safeText, sourceLanguage, targetLanguage, { aiFallback: true });
+  if (result.available && result.text.trim()) {
+    const entry: CachedMessageTranslation = { text: result.text, provider: result.provider, translated_at: new Date().toISOString() };
+    await db.update(s.messages).set({ translations: sql`coalesce(${s.messages.translations}, '{}'::jsonb) || ${JSON.stringify({ [targetLanguage]: entry })}::jsonb` }).where(eq(s.messages.id, message.id));
+    return { ...publicMessage, body: entry.text, originalBody: message.body, sourceLanguage, displayLanguage: targetLanguage, translated: true, translationAvailable: true, translationProvider: entry.provider };
+  }
+
+  await redis.set(failureKey, JSON.stringify({ provider: result.provider }), "EX", 300);
+  return { ...publicMessage, body: message.body, originalBody: message.body, sourceLanguage, displayLanguage: sourceLanguage, requestedLanguage: targetLanguage, translated: false, translationAvailable: false, translationProvider: result.provider };
+}
+
 function normalizedTokens(text: string) {
   return new Set(text.toLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter((token) => token.length > 2));
 }
@@ -137,17 +219,117 @@ async function deliveryLedger(entityType: string, entityId: string, notification
       attempts.push({ id: id("del"), entityType, entityId, channel: "push/fcm", status: response.ok ? "delivered" : "failed", detail: response.ok ? `Accepted for ${fcmTokens.length} configured test device(s)` : `FCM returned HTTP ${response.status}` });
     } catch { attempts.push({ id: id("del"), entityType, entityId, channel: "push/fcm", status: "failed", detail: "FCM request failed; no credential or token detail logged" }); }
   } else attempts.push({ id: id("del"), entityType, entityId, channel: "push/fcm", status: "not_configured", detail: process.env.FCM_SERVER_KEY ? "FCM_TEST_TOKENS is empty; outbound delivery restricted to test devices" : "FCM_SERVER_KEY is not set" });
-  const smsRecipients = String(process.env.MSG91_TEST_RECIPIENTS || "").split(",").map((item) => item.replace(/\D/g, "")).filter((item) => /^\d{10,15}$/.test(item)).slice(0, 25);
-  if (process.env.MSG91_AUTH_KEY && process.env.MSG91_TEMPLATE_ID && smsRecipients.length) {
+  const smsRecipients = configuredSmsRecipients();
+  const textbelt = await dispatchTextbelt(notification.title || "BEACON update", notification.body || "Open BEACON for details.", smsRecipients);
+  if (textbelt) {
+    externalDelivered ||= textbelt.accepted > 0;
+    attempts.push({ id: id("del"), entityType, entityId, channel: "sms/textbelt", status: textbelt.accepted === smsRecipients.length ? "accepted" : "queued", detail: textbelt.detail });
+  } else attempts.push({ id: id("del"), entityType, entityId, channel: "sms/textbelt", status: "not_configured", detail: config.textbelt.url ? "TEXTBELT_TEST_RECIPIENTS is empty" : "TEXTBELT_URL is not set" });
+  if ((!textbelt || textbelt.accepted < smsRecipients.length) && process.env.MSG91_AUTH_KEY && process.env.MSG91_TEMPLATE_ID && smsRecipients.length) {
     const variable = process.env.MSG91_MESSAGE_VARIABLE || "BEACON_MESSAGE";
     try {
       const response = await fetch("https://control.msg91.com/api/v5/flow/", { method: "POST", signal: AbortSignal.timeout(6_000), headers: { authkey: process.env.MSG91_AUTH_KEY, "Content-Type": "application/json", accept: "application/json" }, body: JSON.stringify({ template_id: process.env.MSG91_TEMPLATE_ID, short_url: "0", recipients: smsRecipients.map((mobiles) => ({ mobiles, [variable]: `${notification.title || "BEACON update"}: ${notification.body || "Open BEACON for details."}`.slice(0, 320) })) }) });
       externalDelivered ||= response.ok;
       attempts.push({ id: id("del"), entityType, entityId, channel: "sms/msg91", status: response.ok ? "delivered" : "failed", detail: response.ok ? `Accepted for ${smsRecipients.length} configured test recipient(s)` : `MSG91 returned HTTP ${response.status}` });
     } catch { attempts.push({ id: id("del"), entityType, entityId, channel: "sms/msg91", status: "failed", detail: "MSG91 request failed; no credential or recipient detail logged" }); }
-  } else attempts.push({ id: id("del"), entityType, entityId, channel: "sms/msg91", status: "not_configured", detail: process.env.MSG91_AUTH_KEY ? "MSG91 template/test recipients are incomplete; outbound delivery restricted to test recipients" : "MSG91_AUTH_KEY is not set" });
+  } else attempts.push({ id: id("del"), entityType, entityId, channel: "sms/msg91", status: textbelt?.accepted === smsRecipients.length && smsRecipients.length ? "not_needed" : "not_configured", detail: textbelt?.accepted === smsRecipients.length && smsRecipients.length ? "Textbelt accepted all configured test recipients" : process.env.MSG91_AUTH_KEY ? "MSG91 template/test recipients are incomplete; outbound delivery restricted to test recipients" : "MSG91_AUTH_KEY is not set" });
   attempts.push({ id: id("del"), entityType, entityId, channel: "store-and-forward", status: connected || externalDelivered ? "not_needed" : "queued", detail: connected || externalDelivered ? "At least one delivery path accepted the update" : "Retained for authenticated reconnect delivery" });
   await db.insert(s.deliveryAttempts).values(attempts);
+}
+
+function configuredSmsRecipients() {
+  return String(process.env.TEXTBELT_TEST_RECIPIENTS || process.env.MSG91_TEST_RECIPIENTS || "")
+    .split(",")
+    .map((item) => item.replace(/\D/g, ""))
+    .filter((item) => /^\d{10,15}$/.test(item))
+    .slice(0, 25);
+}
+
+async function dispatchTextbelt(title: string, message: string, recipients: string[]) {
+  if (!config.textbelt.url || !recipients.length) return null;
+  const endpoint = `${config.textbelt.url}/${config.textbelt.region === "us" ? "text" : config.textbelt.region}`;
+  const results = await Promise.all(recipients.map(async (number) => {
+    try {
+      const body = new URLSearchParams({ number, message: `${title}: ${message}`.slice(0, 320) });
+      const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body, signal: AbortSignal.timeout(15_000) });
+      const result = await response.json().catch(() => ({})) as { success?: boolean; message?: string };
+      return { accepted: response.ok && result.success === true, detail: String(result.message || `HTTP ${response.status}`).slice(0, 140) };
+    } catch (error) {
+      return { accepted: false, detail: error instanceof Error ? error.message.slice(0, 140) : "Textbelt request failed" };
+    }
+  }));
+  const accepted = results.filter((result) => result.accepted).length;
+  return {
+    accepted,
+    failed: results.length - accepted,
+    detail: accepted === results.length
+      ? `Textbelt accepted ${accepted} test recipient(s); carrier delivery is unconfirmed`
+      : `Textbelt accepted ${accepted}/${results.length}; ${results.find((result) => !result.accepted)?.detail || "SMTP gateway rejected the request"}`,
+  };
+}
+
+async function dispatchAuthoritySms(
+  entityId: string,
+  title: string,
+  message: string,
+  recipients = configuredSmsRecipients(),
+) {
+  if (config.textbelt.url) {
+    const textbelt = recipients.length
+      ? await dispatchTextbelt(title, message, recipients)
+      : { accepted: 0, failed: 0, detail: "No Textbelt test recipients configured; message retained without external delivery" };
+    const attempt: typeof s.deliveryAttempts.$inferInsert = {
+      id: id("del"), entityType: "manual_sms", entityId,
+      channel: "sms/textbelt",
+      status: textbelt && textbelt.accepted === recipients.length && recipients.length ? "accepted" : "queued",
+      detail: textbelt?.detail || "Textbelt request failed; message retained for retry",
+    };
+    await db.insert(s.deliveryAttempts).values(attempt);
+    return attempt;
+  }
+  const attempt: typeof s.deliveryAttempts.$inferInsert = {
+    id: id("del"),
+    entityType: "manual_sms",
+    entityId,
+    channel: "sms/msg91",
+    status: "queued",
+    detail: "SMS retained for configured test recipients",
+  };
+  if (!process.env.MSG91_AUTH_KEY || !process.env.MSG91_TEMPLATE_ID || !recipients.length) {
+    attempt.detail = !recipients.length
+      ? "No test recipients configured; message retained without external delivery"
+      : "MSG91 credentials incomplete; message retained for store-and-forward";
+  } else {
+    const variable = process.env.MSG91_MESSAGE_VARIABLE || "BEACON_MESSAGE";
+    try {
+      const response = await fetch("https://control.msg91.com/api/v5/flow/", {
+        method: "POST",
+        signal: AbortSignal.timeout(6_000),
+        headers: {
+          authkey: process.env.MSG91_AUTH_KEY,
+          "Content-Type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify({
+          template_id: process.env.MSG91_TEMPLATE_ID,
+          short_url: "0",
+          recipients: recipients.map((mobiles) => ({
+            mobiles,
+            [variable]: `${title}: ${message}`.slice(0, 320),
+          })),
+        }),
+      });
+      attempt.status = response.ok ? "delivered" : "queued";
+      attempt.detail = response.ok
+        ? `Accepted for ${recipients.length} configured test recipient(s)`
+        : `MSG91 returned HTTP ${response.status}; message remains in the delivery ledger`;
+    } catch {
+      attempt.status = "queued";
+      attempt.detail = "MSG91 request failed; message is retained for store-and-forward";
+    }
+  }
+  await db.insert(s.deliveryAttempts).values(attempt);
+  return attempt;
 }
 
 await app.register(cors, { origin: true, methods: ["GET", "POST", "PATCH", "DELETE"] });
@@ -157,9 +339,20 @@ await app.register(swagger, { openapi: { info: { title: "BEACON Crisis Intellige
 await app.register(swaggerUi, { routePrefix: "/docs" });
 
 app.setErrorHandler((error: any, _request, reply) => {
-  app.log.error(error);
-  reply.code(error.statusCode || 500).send({ detail: error.statusCode ? error.message : "BEACON service error", request_id: id("err") });
+  const statusCode = Number(error.statusCode) || 500;
+  if (statusCode >= 500) app.log.error(error);
+  else app.log.warn({ statusCode, message: error.message }, "Request rejected");
+  reply.code(statusCode).send({ detail: statusCode < 500 ? error.message : "BEACON service error", request_id: id("err") });
 });
+
+app.get("/api/v1", async () => ({
+  name: "BEACON Crisis Intelligence API",
+  status: "ready",
+  version: "2.0.0",
+  health: "/api/v1/health",
+  documentation: "/docs",
+  note: "Use the BEACON citizen app or authority dashboard to submit authenticated requests.",
+}));
 
 app.get("/api/v1/health", async () => {
   const pg = await pool.query("SELECT PostGIS_Version() AS postgis");
@@ -176,16 +369,27 @@ app.get("/api/v1/ws", { websocket: true }, async (socket: any, request: any) => 
   socket.on("close", () => sockets.delete(socket));
 });
 
-app.post("/api/v1/citizens/session", async (request: any) => {
+app.post("/api/v1/citizens/session", async (request: any, reply) => {
   await rateLimit(`session:${request.ip}`, 12, 60);
-  const body = request.body as { name: string; phone: string; language?: string; device_id: string };
+  const body = parseBody(citizenSessionSchema, request.body, reply);
+  if (!body) return;
   const [existing] = await db.select().from(s.citizens).where(and(eq(s.citizens.phone, body.phone), eq(s.citizens.deviceId, body.device_id))).limit(1);
-  const citizen = existing || { id: id("cit"), name: body.name, phone: body.phone, language: body.language || "en", deviceId: body.device_id };
-  if (!existing) await db.insert(s.citizens).values(citizen);
-  else await db.update(s.citizens).set({ name: body.name, language: body.language || existing.language }).where(eq(s.citizens.id, existing.id));
+  let citizen = existing || { id: id("cit"), name: body.name, phone: body.phone, language: body.language || "en", deviceId: body.device_id, createdAt: new Date() };
+  if (!existing) [citizen] = await db.insert(s.citizens).values(citizen).returning();
+  else [citizen] = await db.update(s.citizens).set({ name: body.name, language: body.language || existing.language }).where(eq(s.citizens.id, existing.id)).returning();
   const token = id("cses"), expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60_000);
   await db.insert(s.citizenSessions).values({ id: token, citizenId: citizen.id, deviceId: body.device_id, expiresAt });
   return { citizen: snake(citizen), token, expires_at: expiresAt.toISOString() };
+});
+
+app.patch("/api/v1/citizens/:id/language", async (request: any, reply) => {
+  if (!(await requireCitizen(request, reply, request.params.id))) return;
+  const language = String(request.body?.language || "").trim();
+  if (!supportedLanguageCodes.has(language as any)) return safeError(reply, 400, "Unsupported language code");
+  const [citizen] = await db.update(s.citizens).set({ language }).where(eq(s.citizens.id, request.params.id)).returning();
+  if (!citizen) return safeError(reply, 404, "Citizen not found");
+  await emit("citizen.language.updated", { citizen_id: citizen.id, language }, { kind: "citizen", citizenId: citizen.id });
+  return { citizen: snake(citizen), translation_cache: "per-message/per-language" };
 });
 
 app.get("/api/v1/languages", async () => ({ languages: INDIAN_LANGUAGES, provider: "BHASHINI", configured: serviceReadiness().language.configured }));
@@ -200,6 +404,26 @@ app.post("/api/v1/translate", async (request: any, reply) => {
   return translateText(redactPII(text).text, source, target);
 });
 
+app.post("/api/v1/extension/translate", async (request: any, reply) => {
+  await rateLimit(`extension-translate:${request.ip}`, 20, 60);
+  const body = request.body as { text?: string; source_language?: string; target_language?: string };
+  const source = String(body.source_language || "auto"), target = String(body.target_language || "en"), text = String(body.text || "").trim();
+  if (!text || text.length > 20_000) return safeError(reply, 400, "Translation text must contain 1–20,000 characters");
+  return translateForExtension(redactPII(text).text, source, target);
+});
+
+app.post("/api/v1/extension/fact-check", async (request: any, reply) => {
+  await rateLimit(`extension-fact-check:${request.ip}`, 12, 60);
+  const body = request.body as { image?: string; page_title?: string; page_url?: string };
+  const match = String(body.image || "").match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/);
+  if (!match) return safeError(reply, 400, "A JPEG, PNG, or WebP screenshot is required");
+  if (match[2].length > 10_000_000) return safeError(reply, 413, "Screenshot is too large");
+  const analysis = await analyzeExtensionScreenshot({ mime: match[1], data: match[2] }, String(body.page_title || "").slice(0, 300));
+  const verification = await verifyClaim(analysis.result.search_query);
+  const verdict = verification.verdict === "Corroborating coverage" ? "Unverified" : verification.verdict === "Insufficient external evidence" ? "Unverified" : verification.verdict;
+  return { ok: true, claim: analysis.result.claim, verdict, reasoning: `${analysis.result.reasoning} ${verification.summary}`, sources: verification.sources, tone: verdict === "Contradicted" ? "red" : verdict === "Supported" ? "teal" : "amber", confidence: verification.confidence, confidence_basis: verification.confidence_basis, provider: `${analysis.provider} · ${verification.providers.join(" + ") || "external checks unavailable"}`, errors: [...analysis.errors, ...verification.errors], human_review_required: true };
+});
+
 app.post("/api/v1/authority/login", async (request: any, reply) => {
   await rateLimit(`authority-login:${request.ip}`, 10, 60);
   const { email, password } = request.body as { email: string; password: string };
@@ -212,7 +436,8 @@ app.post("/api/v1/authority/login", async (request: any, reply) => {
 });
 
 app.get("/api/v1/context", async (request: any) => {
-  const lat = Number(request.query?.lat || 21.2514), lon = Number(request.query?.lon || 81.6296);
+  const parsed = coordinateSchema.safeParse({ latitude: request.query?.lat ?? 21.2514, longitude: request.query?.lon ?? 81.6296 });
+  const { latitude: lat, longitude: lon } = parsed.success ? parsed.data : { latitude: 21.2514, longitude: 81.6296 };
   const key = `weather:${lat.toFixed(2)}:${lon.toFixed(2)}`;
   let weather = JSON.parse((await redis.get(key)) || "null");
   if (!weather) {
@@ -242,6 +467,44 @@ app.get("/api/v1/media/local/:storageKey", async (request: any, reply) => {
   return reply.header("Cache-Control", "private, max-age=300").type(evidence.mimeType).send(content);
 });
 
+app.post("/api/v1/authority/reports/:reportId/media/:index/transcribe", async (request: any, reply) => {
+  const principal = await requireOfficial(request, reply);
+  if (!principal) return;
+  const mediaIndex = Number(request.params.index);
+  if (!Number.isInteger(mediaIndex) || mediaIndex < 0) return safeError(reply, 400, "Invalid media index");
+  const [report] = await db.select({ id: s.reports.id, media: s.reports.media }).from(s.reports).where(eq(s.reports.id, request.params.reportId)).limit(1);
+  if (!report) return safeError(reply, 404, "Report not found");
+  const media = Array.isArray(report.media) ? [...report.media as any[]] : [];
+  const item = media[mediaIndex];
+  if (!item || item.resource_type !== "audio") return safeError(reply, 404, "Audio evidence not found");
+  const [evidence] = await db.select().from(s.mediaEvidence).where(and(eq(s.mediaEvidence.reportId, report.id), eq(s.mediaEvidence.url, item.url))).limit(1);
+  if (!evidence) return safeError(reply, 404, "Retained audio file not found");
+  let content: Buffer;
+  if (evidence.provider === "local") {
+    content = await readLocalMedia(evidence.storageKey);
+  } else {
+    const source = new URL(evidence.secureUrl || evidence.url);
+    if (source.protocol !== "https:" || !source.hostname.endsWith("cloudinary.com")) return safeError(reply, 400, "Untrusted media source");
+    const response = await fetch(source, { signal: AbortSignal.timeout(20_000) });
+    if (!response.ok) return safeError(reply, 502, "Unable to retrieve retained audio");
+    content = Buffer.from(await response.arrayBuffer());
+  }
+  const transcript = await transcribeAudio(content, evidence.mimeType, evidence.originalName);
+  const updated = {
+    ...item,
+    transcript_original: transcript.transcript_original,
+    detected_language: transcript.detected_language,
+    translation_en: transcript.translation_en,
+    transcription_provider: transcript.provider,
+    transcription_available: transcript.available,
+    transcription_errors: transcript.errors,
+  };
+  media[mediaIndex] = updated;
+  await db.update(s.reports).set({ media }).where(eq(s.reports.id, report.id));
+  await audit(principal.id, "audio_transcribed", "report", report.id, undefined, { media_index: mediaIndex, provider: transcript.provider, available: transcript.available });
+  return updated;
+});
+
 app.post("/api/v1/reports", async (request: any, reply) => {
   await rateLimit(`report:${request.ip}`, 8, 60);
   const fields: Record<string, string> = {}, pendingMedia: Array<{ buffer: Buffer; name: string; mime: string }> = [];
@@ -251,13 +514,26 @@ app.post("/api/v1/reports", async (request: any, reply) => {
       pendingMedia.push({ buffer: content, name: String(part.filename || "evidence"), mime: part.mimetype });
     } else fields[part.fieldname] = String(part.value);
   }
-  const citizenId = fields.citizen_id, hazardType = fields.hazard_type, severity = fields.severity, text = fields.text;
-  const latitude = Number(fields.latitude), longitude = Number(fields.longitude);
-  if (!citizenId || !hazardType || !severity || !text || !Number.isFinite(latitude) || !Number.isFinite(longitude)) return safeError(reply, 400, "Complete report fields and a valid location are required");
+  const body = parseBody(reportFieldsSchema, fields, reply);
+  if (!body) return;
+  const { citizen_id: citizenId, hazard_type: hazardType, severity, text, latitude, longitude } = body;
   if (!(await requireCitizen(request, reply, citizenId))) return;
   const [citizen] = await db.select({ id: s.citizens.id, name: s.citizens.name, language: s.citizens.language }).from(s.citizens).where(eq(s.citizens.id, citizenId)).limit(1);
   if (!citizen) return safeError(reply, 404, "Citizen session not found");
-  const storedMedia = await Promise.all(pendingMedia.map((item) => storeMedia(item.buffer, item.name, item.mime)));
+  const storedMedia = await Promise.all(pendingMedia.map(async (item) => {
+    const stored = await storeMedia(item.buffer, item.name, item.mime);
+    if (stored.resourceType !== "audio") return stored;
+    const transcript = await transcribeAudio(item.buffer, stored.mimeType, item.name);
+    return {
+      ...stored,
+      transcriptOriginal: transcript.transcript_original,
+      detectedLanguage: transcript.detected_language,
+      translationEn: transcript.translation_en,
+      transcriptionProvider: transcript.provider,
+      transcriptionAvailable: transcript.available,
+      transcriptionErrors: transcript.errors,
+    };
+  }));
   const nearby = await pool.query(`SELECT * FROM incidents WHERE hazard_type=$1 AND created_at > now()-($4::text || ' hours')::interval AND ST_DWithin(location::geography, ST_SetSRID(ST_MakePoint($2,$3),4326)::geography, $5) ORDER BY created_at DESC LIMIT 8`, [hazardType, longitude, latitude, config.clustering.windowHours, config.clustering.distanceMeters]);
   let best: { row: any; similarity: number; mediaHashMatch: boolean } | undefined;
   for (const row of nearby.rows) {
@@ -268,7 +544,7 @@ app.post("/api/v1/reports", async (request: any, reply) => {
     if (!best || similarity > best.similarity || (mediaHashMatch && !best.mediaHashMatch)) best = { row, similarity, mediaHashMatch };
   }
   const match = best && (best.mediaHashMatch || best.similarity >= config.clustering.textSimilarity) ? best : undefined;
-  const reportLanguage = fields.language || citizen.language;
+  const reportLanguage = body.language || citizen.language;
   const redactedForProviders = redactPII(text, [citizen.name]).text;
   const translation = await translateText(redactedForProviders, reportLanguage, "en");
   const verification = await verifyClaim(translation.text);
@@ -283,8 +559,23 @@ app.post("/api/v1/reports", async (request: any, reply) => {
     await pool.query("UPDATE incidents SET location=ST_SetSRID(ST_MakePoint(longitude,latitude),4326) WHERE id=$1", [incident.id]);
   }
   const reportId = id("rep");
-  const media = storedMedia.map((item) => ({ name: item.originalName, content_type: item.mimeType, sha256: item.sha256, provider: item.provider, url: item.url, resource_type: item.resourceType, bytes: item.bytes }));
-  await db.insert(s.reports).values({ id: reportId, citizenId, incidentId: incident.id, hazardType, severity, originalText: text, translatedText: analysis.result.translation_en, requestedHelp: fields.requested_help || null, latitude, longitude, approximateArea: publicArea(latitude, longitude), trustState: "Unverified", media });
+  const media = storedMedia.map((item) => ({
+    name: item.originalName,
+    content_type: item.mimeType,
+    sha256: item.sha256,
+    provider: item.provider,
+    url: item.url,
+    resource_type: item.resourceType,
+    bytes: item.bytes,
+    fallback_reason: item.fallbackReason,
+    transcript_original: item.transcriptOriginal,
+    detected_language: item.detectedLanguage,
+    translation_en: item.translationEn,
+    transcription_provider: item.transcriptionProvider,
+    transcription_available: item.transcriptionAvailable,
+    transcription_errors: item.transcriptionErrors,
+  }));
+  await db.insert(s.reports).values({ id: reportId, citizenId, incidentId: incident.id, hazardType, severity, originalText: text, translatedText: analysis.result.translation_en, requestedHelp: body.requested_help || null, latitude, longitude, approximateArea: publicArea(latitude, longitude), trustState: "Unverified", media });
   if (storedMedia.length) await db.insert(s.mediaEvidence).values(storedMedia.map((item) => ({ id: id("med"), reportId, provider: item.provider, storageKey: item.storageKey, url: item.url, secureUrl: item.secureUrl, originalName: item.originalName, mimeType: item.mimeType, resourceType: item.resourceType, bytes: item.bytes, sha256: item.sha256, fallbackReason: item.fallbackReason })));
   await pool.query("UPDATE reports SET location=ST_SetSRID(ST_MakePoint(longitude,latitude),4326) WHERE id=$1", [reportId]);
   await db.insert(s.analysisRuns).values({ id: id("ana"), incidentId: incident.id, provider: analysis.meta.provider, latencyMs: analysis.meta.latency_ms, confidence: analysis.meta.confidence, result: analysis.result, errors: analysis.meta.errors, fallbackPath: analysis.meta.fallback_path });
@@ -295,7 +586,8 @@ app.post("/api/v1/reports", async (request: any, reply) => {
 
 app.post("/api/v1/sos", async (request: any, reply) => {
   await rateLimit(`sos:${request.ip}`, 5, 60);
-  const body = request.body as any;
+  const body = parseBody(sosSchema, request.body, reply);
+  if (!body) return;
   const [citizen] = await db.select({ id: s.citizens.id }).from(s.citizens).where(eq(s.citizens.id, body.citizen_id)).limit(1);
   if (!citizen) return safeError(reply, 404, "Citizen session not found");
   if (!(await requireCitizen(request, reply, body.citizen_id))) return;
@@ -320,7 +612,9 @@ app.patch("/api/v1/sos/:id/location", async (request: any, reply) => {
   if (!existing) return safeError(reply, 404, "SOS not found");
   if (!(await requireCitizen(request, reply, existing.citizenId))) return;
   if (["Cancelled", "Resolved", "Closed", "Rejected"].includes(existing.status)) return safeError(reply, 409, "SOS location sharing is no longer active");
-  const [updated] = await db.update(s.sosRequests).set({ latitude: request.body.latitude, longitude: request.body.longitude, updatedAt: new Date() }).where(eq(s.sosRequests.id, request.params.id)).returning();
+  const location = parseBody(coordinateSchema, request.body, reply);
+  if (!location) return;
+  const [updated] = await db.update(s.sosRequests).set({ ...location, updatedAt: new Date() }).where(eq(s.sosRequests.id, request.params.id)).returning();
   if (!updated) return safeError(reply, 404, "SOS not found");
   await pool.query("UPDATE sos_requests SET location=ST_SetSRID(ST_MakePoint(longitude,latitude),4326) WHERE id=$1", [updated.id]);
   await emit("sos.location", updated, { kind: "citizen", citizenId: updated.citizenId }); return snake(updated);
@@ -343,7 +637,67 @@ app.get("/api/v1/authority/queue", async (request, reply) => {
     db.select().from(s.assignments).orderBy(desc(s.assignments.createdAt)), db.select().from(s.alerts).orderBy(desc(s.alerts.publishedAt)), db.select().from(s.deliveryAttempts).orderBy(desc(s.deliveryAttempts.createdAt)).limit(100), db.select().from(s.communities).orderBy(desc(s.communities.createdAt)),
   ]);
   const enriched = await Promise.all(incidentRows.map(async (incident) => ({ ...incident, reports: await db.select().from(s.reports).where(eq(s.reports.incidentId, incident.id)).orderBy(desc(s.reports.createdAt)), analysis: (await db.select().from(s.analysisRuns).where(eq(s.analysisRuns.incidentId, incident.id)).orderBy(desc(s.analysisRuns.createdAt)).limit(1))[0] })));
-  return snake({ incidents: enriched, sos: sosRows, assignments: assignmentRows, alerts: alertRows, delivery: deliveryRows, communities: communityRows });
+  const smsRecipients = configuredSmsRecipients();
+  return snake({
+    incidents: enriched,
+    sos: sosRows,
+    assignments: assignmentRows,
+    alerts: alertRows,
+    delivery: deliveryRows,
+    communities: communityRows,
+    sms: {
+      provider: "Textbelt (self-hosted)",
+      channel: "sms/textbelt",
+      configured: Boolean(config.textbelt.url && smsRecipients.length),
+      smtpConfigured: Boolean(process.env.TEXTBELT_SMTP_HOST && process.env.TEXTBELT_SMTP_USER && process.env.TEXTBELT_SMTP_PASS),
+      testRecipientCount: smsRecipients.length,
+      maxMessageChars: 280,
+    },
+  });
+});
+
+app.post("/api/v1/authority/sms", async (request: any, reply) => {
+  const user = await requireOfficial(request, reply, "admin");
+  if (!user || !("id" in user)) return;
+  const body = request.body as {
+    title?: string;
+    message?: string;
+    recipients?: string[];
+    incident_id?: string;
+  };
+  const title = String(body.title || "BEACON safety update").trim().slice(0, 80);
+  const message = String(body.message || "").trim();
+  if (message.length < 8 || message.length > 280)
+    return safeError(reply, 400, "SMS message must contain 8 to 280 characters");
+
+  const allowed = configuredSmsRecipients();
+  const requested = Array.isArray(body.recipients)
+    ? body.recipients
+        .map((item) => String(item).replace(/\D/g, ""))
+        .filter(Boolean)
+    : [];
+  if (requested.some((recipient) => !allowed.includes(recipient)))
+    return safeError(reply, 403, "SMS recipients must be present in TEXTBELT_TEST_RECIPIENTS");
+  const recipients = requested.length ? [...new Set(requested)].slice(0, 25) : allowed;
+  const smsId = id("sms");
+  const attempt = await dispatchAuthoritySms(smsId, title, message, recipients);
+  await audit(
+    user.id,
+    ["accepted", "delivered"].includes(attempt.status) ? "sms_dispatched" : "sms_queued",
+    "manual_sms",
+    smsId,
+    body.incident_id ? "Incident communication" : "Authority safety communication",
+    { incident_id: body.incident_id || null, recipient_count: recipients.length, delivery_status: attempt.status },
+  );
+  const response = snake({
+    id: smsId,
+    channel: attempt.channel,
+    status: attempt.status,
+    detail: attempt.detail,
+    recipientCount: recipients.length,
+  });
+  await emit("delivery.sms", response, { kind: "authority" });
+  return reply.code(["accepted", "delivered"].includes(attempt.status) ? 201 : 202).send(response);
 });
 
 app.post("/api/v1/incidents/:id/source-check", async (request: any, reply) => {
@@ -464,14 +818,23 @@ app.patch("/api/v1/facilities/:id", async (request: any, reply) => {
   await audit(user.id, "facility_updated", "facility", updated.id, body.reason); await emit("facility.updated", updated, { kind: "authenticated" }); return snake(updated);
 });
 
-app.get("/api/v1/communities", async () => {
+app.get("/api/v1/communities", async (request: any) => {
+  const principal = await resolvePrincipal(request.headers.authorization?.replace("Bearer ", ""));
+  let targetLanguage = "en";
+  if (principal?.kind === "citizen") {
+    const [citizen] = await db.select({ language: s.citizens.language }).from(s.citizens).where(eq(s.citizens.id, principal.id)).limit(1);
+    if (citizen && supportedLanguageCodes.has(citizen.language as any)) targetLanguage = citizen.language;
+  }
   const result = await db.select().from(s.communities).where(and(eq(s.communities.approved, true), eq(s.communities.status, "approved"))).orderBy(desc(s.communities.createdAt));
-  return snake(await Promise.all(result.map(async (community) => ({ ...community, messages: await db.select().from(s.messages).where(and(eq(s.messages.communityId, community.id), eq(s.messages.moderationStatus, "visible"))).orderBy(s.messages.createdAt) }))));
+  return snake(await Promise.all(result.map(async (community) => {
+    const messages = await db.select().from(s.messages).where(and(eq(s.messages.communityId, community.id), eq(s.messages.moderationStatus, "visible"))).orderBy(s.messages.createdAt);
+    return { ...community, messages: await Promise.all(messages.map((message) => localizeCommunityMessage(message, targetLanguage))) };
+  })));
 });
 
 app.post("/api/v1/communities", async (request: any, reply) => {
   const user = await requireOfficial(request, reply, "admin"); if (!user || !("id" in user)) return; const body = request.body as any;
-  const approved = body.approved ?? true;
+  const approved = body.approved ?? false;
   const [created] = await db.insert(s.communities).values({ id: id("com"), name: body.name, incidentId: body.incident_id || null, radiusKm: body.radius_km || 2, approved, status: approved ? "approved" : "proposed", memberCount: 0 }).returning();
   await audit(user.id, "community_created", "community", created.id); await emit("community.created", created, { kind: "authenticated" }); return snake(created);
 });
@@ -482,26 +845,41 @@ app.patch("/api/v1/communities/:id/status", async (request: any, reply) => {
   const mapped = status === "approve" ? "approved" : status === "reject" ? "rejected" : "archived";
   const [updated] = await db.update(s.communities).set({ status: mapped, approved: mapped === "approved" }).where(eq(s.communities.id, request.params.id)).returning();
   if (!updated) return safeError(reply, 404, "Community not found");
+  if (mapped === "approved" && updated.incidentId) {
+    const [incident] = await db.select().from(s.incidents).where(eq(s.incidents.id, updated.incidentId)).limit(1);
+    const [analysis] = await db.select().from(s.analysisRuns).where(eq(s.analysisRuns.incidentId, updated.incidentId)).orderBy(desc(s.analysisRuns.createdAt)).limit(1);
+    if (incident) {
+      const verification = (analysis?.result as any)?.verification;
+      const sourceLinks = Array.isArray(verification?.sources)
+        ? verification.sources.filter((source: any) => /^https?:\/\//.test(String(source?.url || ""))).slice(0, 3).map((source: any) => `${String(source.publisher || "Source")}: ${String(source.url)}`)
+        : [];
+      const mapUrl = `https://www.openstreetmap.org/?mlat=${incident.latitude}&mlon=${incident.longitude}#map=15/${incident.latitude}/${incident.longitude}`;
+      const body = [`Official room opened for ${incident.approximateArea}.`, `Map: ${mapUrl}`, `AI advisory: ${incident.analysisSummary}`, ...sourceLinks.map((source: string) => `Related source: ${source}`), "Follow authority instructions; related coverage is context, not proof."].join("\n");
+      const [welcome] = await db.insert(s.messages).values({ id: id("msg"), communityId: updated.id, senderName: user.name, senderRole: user.role, body, sourceLanguage: "en", official: true, moderationStatus: "visible" }).returning();
+      await emit("community.message", welcome, { kind: "authenticated" });
+    }
+  }
   await audit(user.id, `community_${mapped}`, "community", updated.id, request.body.reason); await emit("community.updated", updated, { kind: "authenticated" }); return snake(updated);
 });
 
 app.post("/api/v1/communities/:id/messages", async (request: any, reply) => {
-  const body = request.body as any;
+  const body = parseBody(communityMessageSchema, request.body, reply);
+  if (!body) return;
   const principal = await resolvePrincipal(request.headers.authorization?.replace("Bearer ", ""));
   if (!principal) return safeError(reply, 401, "Authenticated session required");
-  let senderName: string, role: string;
+  let senderName: string, role: string, sourceLanguage = body.source_language || "en";
   if (principal.kind === "official") {
     const [user] = await db.select({ name: s.officialUsers.name, role: s.officialUsers.role }).from(s.officialUsers).where(eq(s.officialUsers.id, principal.id)).limit(1);
     if (!user) return safeError(reply, 401, "Authority session required");
     senderName = user.name; role = user.role;
   } else {
-    const [citizen] = await db.select({ name: s.citizens.name }).from(s.citizens).where(eq(s.citizens.id, principal.id)).limit(1);
+    const [citizen] = await db.select({ name: s.citizens.name, language: s.citizens.language }).from(s.citizens).where(eq(s.citizens.id, principal.id)).limit(1);
     if (!citizen) return safeError(reply, 401, "Citizen session required");
-    senderName = citizen.name; role = "citizen";
+    senderName = citizen.name; role = "citizen"; sourceLanguage = citizen.language;
   }
   const [community] = await db.select().from(s.communities).where(eq(s.communities.id, request.params.id)).limit(1);
   if (!community || !community.approved || community.status !== "approved") return safeError(reply, 409, "Community is not open for messages");
-  const [created] = await db.insert(s.messages).values({ id: id("msg"), communityId: request.params.id, senderName, senderRole: role, body: body.body, official: principal.kind === "official", moderationStatus: "visible" }).returning();
+  const [created] = await db.insert(s.messages).values({ id: id("msg"), communityId: request.params.id, senderName, senderRole: role, body: body.body, sourceLanguage, official: principal.kind === "official", moderationStatus: "visible" }).returning();
   await emit("community.message", created, { kind: "authenticated" }); return snake(created);
 });
 
@@ -517,7 +895,9 @@ app.get("/api/v1/audit", async (request, reply) => { if (!(await requireOfficial
 
 app.post("/api/v1/demo/reset", async (request, reply) => {
   const user = await requireOfficial(request, reply, "admin"); if (!user || !("id" in user)) return;
-  await pool.query("TRUNCATE delivery_attempts, corrections, messages, communities, assignments, sos_requests, analysis_runs, reports, alerts, incidents, audit_events, citizens RESTART IDENTITY CASCADE");
+  // A demo reset clears operational data, not registered devices. Keeping citizen
+  // sessions prevents a judge reset from silently breaking an already-open phone.
+  await pool.query("TRUNCATE delivery_attempts, corrections, messages, communities, assignments, sos_requests, analysis_runs, reports, alerts, incidents, audit_events RESTART IDENTITY CASCADE");
   const cacheKeys = (await redis.keys("weather:*")).concat(await redis.keys("rate:*"));
   if (cacheKeys.length) await redis.del(...cacheKeys);
   await emit("demo.reset", { actor: user.id }); return { ok: true };

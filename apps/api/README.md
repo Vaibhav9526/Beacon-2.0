@@ -6,12 +6,14 @@ Fastify API backed by Drizzle ORM, PostgreSQL/PostGIS, and Redis. Docker Compose
 
 Copy the repository `.env.example` to `.env` and set only the providers available for the demo. Never commit `.env`.
 
-- AI order is Gemini, Groq, then validated deterministic local analysis.
+- AI and fact-check synthesis order is Claude, Gemini, Groq, then validated deterministic local analysis.
 - Cloud AI receives redacted report text only; citizen name, phone, email, and exact coordinate patterns are removed. Coordinates are never added to the cloud prompt.
 - Every analysis run stores provider, latency, validation/fallback path, sanitized errors, confidence for authority review, and specialist provenance.
 - First-aid content always comes from `src/protocols.ts`; models may select a protocol ID but cannot author treatment.
+- Community messages retain their original text and source language. Authenticated citizen reads are localized to the citizen's saved language through BHASHINI, then Gemini/Groq/Claude fallbacks, and successful translations are cached per message/language. The app labels translated content, offers a `View original` control, and visibly retains the original if providers are unavailable.
 - Cloudinary requires `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET`. Missing or failed Cloudinary configuration automatically writes evidence to the durable `beacon_uploads` volume. `/api/v1/health` reports the active provider and missing variable names without exposing values.
-- Outbound alert delivery attempts authenticated WebSocket first, then configured FCM and MSG91 adapters, then durable store-and-forward. Provider delivery is disabled unless `FCM_TEST_TOKENS` or `MSG91_TEST_RECIPIENTS` is explicitly populated, so judge runs cannot contact arbitrary recipients. Each provider response becomes a delivery-ledger row without logging credentials, device tokens, or phone numbers.
+- Outbound alert delivery attempts authenticated WebSocket first, self-hosted Textbelt SMS, configured FCM/MSG91 fallbacks, then durable store-and-forward. Textbelt accepts only numbers in `TEXTBELT_TEST_RECIPIENTS` and requires the `TEXTBELT_SMTP_*` settings; this prevents judge runs from contacting arbitrary recipients. Each provider response becomes a delivery-ledger row without logging credentials, device tokens, or phone numbers.
+- Admins can send a 280-character operational SMS with `POST /api/v1/authority/sms`. The API calls Textbelt over the private Compose network and records `sms/textbelt`; missing SMTP or recipients produces an audited queued result instead of falsely claiming delivery. The command centre reads provider readiness from `GET /api/v1/authority/queue`.
 
 ## Verification
 
@@ -22,7 +24,7 @@ docker compose up --build -d api
 npm run smoke --workspace apps/api
 ```
 
-The smoke test resets only the isolated BEACON demo tenant, then verifies PostGIS/Redis health, citizen registration, accepted/rejected media, duplicate clustering, AI provenance, audited bypass authorization, official map separation, alert/correction delivery, SOS cancellation and assignment lifecycle, community moderation, and WebSocket events. It resets demo data again on success.
+The smoke test resets only the isolated BEACON demo tenant, then verifies PostGIS/Redis health, citizen registration, accepted/rejected media, duplicate clustering, AI provenance, audited bypass authorization, official map separation, alert/correction delivery, manual SMS delivery or queueing, SOS cancellation and assignment lifecycle, community moderation, and WebSocket events. It resets demo data again on success.
 
 API documentation is available at `http://localhost:8000/docs`; operational readiness is at `http://localhost:8000/api/v1/health`.
 

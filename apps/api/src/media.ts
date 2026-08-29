@@ -16,6 +16,12 @@ export type StoredMedia = {
   sha256: string;
   resourceType: "image" | "video" | "audio";
   fallbackReason?: string;
+  transcriptOriginal?: string;
+  detectedLanguage?: string;
+  translationEn?: string;
+  transcriptionProvider?: string;
+  transcriptionAvailable?: boolean;
+  transcriptionErrors?: string[];
 };
 
 export function mediaResourceType(mime: string): StoredMedia["resourceType"] {
@@ -26,7 +32,32 @@ export function mediaResourceType(mime: string): StoredMedia["resourceType"] {
 
 function assertMedia(buffer: Buffer, mime: string) {
   if (!allowedMime.has(mime)) throw Object.assign(new Error(`Unsupported evidence format: ${mime}`), { statusCode: 415 });
+  if (buffer.length < 16) throw Object.assign(new Error("Evidence file is empty or incomplete"), { statusCode: 422 });
   if (buffer.length > config.uploads.maxFileBytes) throw Object.assign(new Error("Evidence file exceeds the configured upload limit"), { statusCode: 413 });
+  const ascii = buffer.subarray(0, 16).toString("ascii");
+  const valid =
+    (mime === "image/jpeg" && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) ||
+    (mime === "image/png" && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) ||
+    (mime === "image/webp" && ascii.startsWith("RIFF") && ascii.slice(8, 12) === "WEBP") ||
+    (["video/mp4", "video/quicktime", "audio/mp4", "audio/x-m4a"].includes(mime) && ascii.slice(4, 8) === "ftyp") ||
+    (mime === "video/webm" && buffer.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))) ||
+    (mime === "audio/wav" && ascii.startsWith("RIFF") && ascii.slice(8, 12) === "WAVE") ||
+    (mime === "audio/ogg" && ascii.startsWith("OggS")) ||
+    (mime === "audio/mpeg" && (ascii.startsWith("ID3") || (buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0)));
+  if (!valid) throw Object.assign(new Error(`Evidence bytes do not match declared format ${mime}`), { statusCode: 422 });
+}
+
+export function normalizeMediaMime(buffer: Buffer, originalName: string, declaredMime: string) {
+  const mime = declaredMime.toLowerCase().split(";", 1)[0].trim();
+  const extension = originalName.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] || "";
+  const isIsoMedia = buffer.length >= 12 && buffer.subarray(4, 8).toString("ascii") === "ftyp";
+
+  // Expo File on Android can report an AAC-in-M4A recording as audio/mpeg.
+  // Only normalize when both the trusted byte signature and audio extension agree.
+  if (isIsoMedia && ["m4a", "aac", "mp4"].includes(extension) && ["audio/mpeg", "audio/x-m4a", "application/octet-stream"].includes(mime)) {
+    return "audio/mp4";
+  }
+  return mime;
 }
 
 async function localStore(buffer: Buffer, originalName: string, mime: string, sha256: string, fallbackReason?: string): Promise<StoredMedia> {
@@ -47,20 +78,26 @@ async function cloudinaryStore(buffer: Buffer, originalName: string, mime: strin
   form.set("file", new Blob([Uint8Array.from(buffer)], { type: mime }), originalName);
   form.set("api_key", apiKey); form.set("timestamp", String(timestamp)); form.set("signature", signature); form.set("folder", folder); form.set("public_id", publicId);
   const response = await fetch(`https://api.cloudinary.com/v1_1/${encodeURIComponent(cloudName)}/auto/upload`, { method: "POST", body: form, signal: AbortSignal.timeout(20_000) });
-  if (!response.ok) throw new Error(`Cloudinary upload HTTP ${response.status}`);
-  const json = await response.json() as any;
-  if (!json.secure_url || !json.public_id) throw new Error("Cloudinary response missing media URL");
-  return { provider: "cloudinary", storageKey: json.public_id, url: json.secure_url, secureUrl: json.secure_url, originalName, mimeType: mime, bytes: buffer.length, sha256, resourceType: mediaResourceType(mime) };
+  const json = await response.json().catch(() => ({})) as any;
+  if (!response.ok) {
+    const providerMessage = String(json?.error?.message || "provider rejected the upload")
+      .replace(/[\r\n]+/g, " ")
+      .slice(0, 120);
+    throw new Error(`Cloudinary upload HTTP ${response.status}: ${providerMessage}`);
+  }
+  if (!json.secure_url || !json.public_id || !Number.isFinite(json.bytes) || json.bytes <= 0) throw new Error("Cloudinary response missing valid media metadata");
+  return { provider: "cloudinary", storageKey: json.public_id, url: json.secure_url, secureUrl: json.secure_url, originalName, mimeType: mime, bytes: json.bytes, sha256, resourceType: mediaResourceType(mime) };
 }
 
 export async function storeMedia(buffer: Buffer, originalName: string, mime: string): Promise<StoredMedia> {
-  assertMedia(buffer, mime);
+  const normalizedMime = normalizeMediaMime(buffer, originalName, mime);
+  assertMedia(buffer, normalizedMime);
   const sha256 = createHash("sha256").update(buffer).digest("hex");
   if (config.cloudinary.cloudName && config.cloudinary.apiKey && config.cloudinary.apiSecret) {
-    try { return await cloudinaryStore(buffer, originalName, mime, sha256); }
-    catch (error) { return localStore(buffer, originalName, mime, sha256, error instanceof Error ? error.message.slice(0, 180) : "Cloudinary upload failed"); }
+    try { return await cloudinaryStore(buffer, originalName, normalizedMime, sha256); }
+    catch (error) { return localStore(buffer, originalName, normalizedMime, sha256, error instanceof Error ? error.message.slice(0, 180) : "Cloudinary upload failed"); }
   }
-  return localStore(buffer, originalName, mime, sha256, "Cloudinary is not fully configured");
+  return localStore(buffer, originalName, normalizedMime, sha256, "Cloudinary is not fully configured");
 }
 
 export async function readLocalMedia(storageKey: string) {
