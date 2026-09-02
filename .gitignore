@@ -13,3 +13,45 @@ apps/dashboard/.next-stale-*/
 .env
 .env.local
 .impeccable/review/
+
+# Local design explorations and reference material
+/design/
+/ui-app/
+/ui-dashboard/
+/idea/*.pdf
+/idea/*.txt
+/idea/PS.png
+
+# Generated screenshots, UI dumps, and local tooling
+/.artifacts/
+/.tools/
+*.hbc
+*-qr.png
+*_QR.png
+
+# Local planning / throwaway documentation
+/DESIGN.md
+/PRODUCT.md
+/SIH_PRESENTATION_QA.txt
+**/COMPS.md
+**/DUMMY*.md
+**/NOTES*.md
+**/TODO*.md
+
+# Android build products
+apps/mobile/android/.gradle/
+apps/mobile/android/.kotlin/
+apps/mobile/android/build/
+apps/mobile/android/app/.cxx/
+apps/mobile/android/app/build/
+
+# Locally packaged browser extensions
+Extension/*.zip
+
+# Runtime uploads and local databases
+apps/api/apps/api/uploads/
+beacon.db
+
+# Unused local dependency/vendor experiments and alternate lockfile
+/vendor/
+/pnpm-lock.yaml
