@@ -77,7 +77,7 @@ async function cloudinaryStore(buffer: Buffer, originalName: string, mime: strin
   const form = new FormData();
   form.set("file", new Blob([Uint8Array.from(buffer)], { type: mime }), originalName);
   form.set("api_key", apiKey); form.set("timestamp", String(timestamp)); form.set("signature", signature); form.set("folder", folder); form.set("public_id", publicId);
-  const response = await fetch(`https://api.cloudinary.com/v1_1/${encodeURIComponent(cloudName)}/auto/upload`, { method: "POST", body: form, signal: AbortSignal.timeout(20_000) });
+  const response = await fetch(`https://api.cloudinary.com/v1_1/${encodeURIComponent(cloudName)}/auto/upload`, { method: "POST", body: form, signal: AbortSignal.timeout(10_000) });
   const json = await response.json().catch(() => ({})) as any;
   if (!response.ok) {
     const providerMessage = String(json?.error?.message || "provider rejected the upload")

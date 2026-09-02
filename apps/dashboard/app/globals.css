@@ -1330,6 +1330,27 @@ svg {
   }
 }
 
+.command-shell .danger-action {
+  border-color: #b4232c !important;
+  background: #b4232c !important;
+  color: #fff !important;
+}
+.command-shell .danger-action svg {
+  width: 13px;
+  height: 13px;
+}
+.community-status-actions button,
+.message-stream footer button,
+.incident-inline-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+.message-stream article:has(.state-badge[data-state="deleted"]) {
+  opacity: .68;
+}
+
 /* BEACON command palette: supplied navy, royal blue, periwinkle and sky. */
 .command-shell {
   --beacon-navy: #0a1747;

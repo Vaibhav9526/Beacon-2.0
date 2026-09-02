@@ -65,8 +65,12 @@ services:
       PORT: 8000
       HOST: 0.0.0.0
       UPLOAD_DIR: /app/data/uploads
+      UPLOAD_MAX_FILE_BYTES: ${UPLOAD_MAX_FILE_BYTES:-25000000}
       PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:8000}
       ALLOW_DEMO_AUTH: ${ALLOW_DEMO_AUTH:-true}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openrouter/free}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
       GEMINI_TRANSLATION_MODEL: ${GEMINI_TRANSLATION_MODEL:-gemini-3.5-flash-lite}

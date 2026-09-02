@@ -9,7 +9,7 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { Pool } from "pg";
 import { Redis } from "ioredis";
 import { mkdir, readFile } from "node:fs/promises";
-import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as s from "./schema.js";
@@ -21,13 +21,30 @@ import { verifyClaim } from "./verification.js";
 import { z } from "zod";
 
 const EVENT_CHANNEL = "beacon:events";
+const INSTANCE_ID = randomUUID();
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-const pool = new Pool({ connectionString: config.databaseUrl, max: 12, idleTimeoutMillis: 30_000 });
+const pool = new Pool({
+  connectionString: config.databaseUrl,
+  max: 12,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 5_000,
+  query_timeout: 30_000,
+  statement_timeout: 30_000,
+});
 const db = drizzle(pool, { schema: s });
-const redis = new Redis(config.redisUrl, { maxRetriesPerRequest: 2, lazyConnect: true });
+const redis = new Redis(config.redisUrl, { maxRetriesPerRequest: 1, lazyConnect: true, enableOfflineQueue: false });
 const subscriber = new Redis(config.redisUrl, { maxRetriesPerRequest: null, lazyConnect: true });
-const app = Fastify({ logger: { level: process.env.LOG_LEVEL || "info", redact: ["req.headers.authorization", "req.headers.cookie", "body.password", "body.api_secret"] }, bodyLimit: Math.max(12 * 1024 * 1024, config.uploads.maxFileBytes * config.uploads.maxFiles + 1_000_000) });
+const app = Fastify({
+  logger: { level: process.env.LOG_LEVEL || "info", redact: ["req.headers.authorization", "req.headers.cookie", "body.password", "body.api_secret"] },
+  bodyLimit: Math.max(12 * 1024 * 1024, config.uploads.maxFileBytes * config.uploads.maxFiles + 1_000_000),
+  // Vision extraction + bounded evidence research can legitimately take more
+  // than ten seconds. The previous socket timeout terminated healthy requests
+  // mid-flight and surfaced as intermittent extension failures.
+  connectionTimeout: 65_000,
+  requestTimeout: 60_000,
+  keepAliveTimeout: 72_000,
+});
 type Principal = { kind: "official"; id: string; role: "admin" | "responder" } | { kind: "citizen"; id: string };
 type Audience = { kind: "authority" } | { kind: "authenticated" } | { kind: "citizen"; citizenId: string };
 const sockets = new Map<any, Principal>();
@@ -50,6 +67,7 @@ const reportFieldsSchema = coordinateSchema.extend({
   text: z.string().trim().min(3).max(4_000),
   requested_help: z.string().trim().max(500).default(""),
   language: z.string().trim().min(2).max(8).optional(),
+  evidence_count: z.coerce.number().int().min(0).max(4).default(0),
 });
 const sosSchema = coordinateSchema.extend({
   citizen_id: z.string().trim().min(4).max(100),
@@ -114,13 +132,36 @@ async function seed() {
 }
 
 async function rateLimit(key: string, limit: number, seconds: number) {
-  const count = await redis.incr(`rate:${key}`);
-  if (count === 1) await redis.expire(`rate:${key}`, seconds);
-  if (count > limit) throw Object.assign(new Error("Too many requests. Please wait and try again."), { statusCode: 429 });
+  try {
+    const count = await redis.incr(`rate:${key}`);
+    if (count === 1) await redis.expire(`rate:${key}`, seconds);
+    if (count > limit) throw Object.assign(new Error("Too many requests. Please wait and try again."), { statusCode: 429 });
+  } catch (error: any) {
+    if (error?.statusCode === 429) throw error;
+    app.log.warn({ err: error, key }, "Redis rate limiter unavailable; allowing request");
+  }
 }
 
 async function emit(event: string, payload: any, audience: Audience = { kind: "authority" }) {
-  await redis.publish(EVENT_CHANNEL, JSON.stringify({ event, payload: snake(payload), audience, at: new Date().toISOString() }));
+  const envelope = { event, payload: snake(payload), audience, at: new Date().toISOString(), origin: INSTANCE_ID };
+  broadcast(envelope);
+  try {
+    await redis.publish(EVENT_CHANNEL, JSON.stringify(envelope));
+  } catch (error) {
+    app.log.warn({ err: error, event }, "Redis publish unavailable; event delivered to local clients only");
+  }
+}
+
+function broadcast(envelope: { event: string; payload: any; audience?: Audience; at: string; origin?: string }) {
+  const outbound = JSON.stringify({ event: envelope.event, payload: envelope.payload, at: envelope.at });
+  for (const [socket, principal] of sockets) {
+    const audience = envelope.audience;
+    const allowed = (!audience && principal.kind === "official") || audience?.kind === "authenticated" || (audience?.kind === "authority" && principal.kind === "official") || (audience?.kind === "citizen" && (principal.kind === "official" || principal.id === audience.citizenId));
+    if (allowed && socket.readyState === 1) {
+      try { socket.send(outbound); }
+      catch (error) { sockets.delete(socket); app.log.warn({ err: error }, "Realtime client send failed"); }
+    }
+  }
 }
 
 async function audit(actorId: string, action: string, entityType: string, entityId: string, reason?: string, detail: Record<string, any> = {}) {
@@ -177,7 +218,7 @@ async function localizeCommunityMessage(message: typeof s.messages.$inferSelect,
   }
 
   const failureKey = `translation-failure:${message.id}:${targetLanguage}`;
-  const recentFailure = await redis.get(failureKey);
+  const recentFailure = await redis.get(failureKey).catch(() => null);
   if (recentFailure) {
     const failure = JSON.parse(recentFailure) as { provider?: string };
     return { ...publicMessage, body: message.body, originalBody: message.body, sourceLanguage, displayLanguage: sourceLanguage, requestedLanguage: targetLanguage, translated: false, translationAvailable: false, translationProvider: failure.provider || "unavailable" };
@@ -192,7 +233,7 @@ async function localizeCommunityMessage(message: typeof s.messages.$inferSelect,
     return { ...publicMessage, body: entry.text, originalBody: message.body, sourceLanguage, displayLanguage: targetLanguage, translated: true, translationAvailable: true, translationProvider: entry.provider };
   }
 
-  await redis.set(failureKey, JSON.stringify({ provider: result.provider }), "EX", 300);
+  await redis.set(failureKey, JSON.stringify({ provider: result.provider }), "EX", 300).catch(() => undefined);
   return { ...publicMessage, body: message.body, originalBody: message.body, sourceLanguage, displayLanguage: sourceLanguage, requestedLanguage: targetLanguage, translated: false, translationAvailable: false, translationProvider: result.provider };
 }
 
@@ -208,9 +249,9 @@ function textSimilarity(left: string, right: string) {
 }
 
 async function deliveryLedger(entityType: string, entityId: string, notification: { title?: string; body?: string } = {}) {
-  const connected = sockets.size;
-  const attempts: typeof s.deliveryAttempts.$inferInsert[] = [{ id: id("del"), entityType, entityId, channel: "in-app/websocket", status: connected ? "delivered" : "queued", detail: `${connected} authenticated live recipient(s)` }];
-  let externalDelivered = false;
+  const connectedCitizens = new Set([...sockets.values()].filter((principal) => principal.kind === "citizen").map((principal) => principal.id)).size;
+  const attempts: typeof s.deliveryAttempts.$inferInsert[] = [{ id: id("del"), entityType, entityId, channel: "notification/realtime-local", status: connectedCitizens ? "accepted" : "not_connected", detail: connectedCitizens ? `Sent to ${connectedCitizens} connected citizen device(s) for Android notification-bar presentation` : "No citizen app is connected; the official feed remains available on reconnect" }];
+  let externalDelivered = connectedCitizens > 0;
   const fcmTokens = String(process.env.FCM_TEST_TOKENS || "").split(",").map((item) => item.trim()).filter(Boolean).slice(0, 100);
   if (process.env.FCM_SERVER_KEY && fcmTokens.length) {
     try {
@@ -219,21 +260,7 @@ async function deliveryLedger(entityType: string, entityId: string, notification
       attempts.push({ id: id("del"), entityType, entityId, channel: "push/fcm", status: response.ok ? "delivered" : "failed", detail: response.ok ? `Accepted for ${fcmTokens.length} configured test device(s)` : `FCM returned HTTP ${response.status}` });
     } catch { attempts.push({ id: id("del"), entityType, entityId, channel: "push/fcm", status: "failed", detail: "FCM request failed; no credential or token detail logged" }); }
   } else attempts.push({ id: id("del"), entityType, entityId, channel: "push/fcm", status: "not_configured", detail: process.env.FCM_SERVER_KEY ? "FCM_TEST_TOKENS is empty; outbound delivery restricted to test devices" : "FCM_SERVER_KEY is not set" });
-  const smsRecipients = configuredSmsRecipients();
-  const textbelt = await dispatchTextbelt(notification.title || "BEACON update", notification.body || "Open BEACON for details.", smsRecipients);
-  if (textbelt) {
-    externalDelivered ||= textbelt.accepted > 0;
-    attempts.push({ id: id("del"), entityType, entityId, channel: "sms/textbelt", status: textbelt.accepted === smsRecipients.length ? "accepted" : "queued", detail: textbelt.detail });
-  } else attempts.push({ id: id("del"), entityType, entityId, channel: "sms/textbelt", status: "not_configured", detail: config.textbelt.url ? "TEXTBELT_TEST_RECIPIENTS is empty" : "TEXTBELT_URL is not set" });
-  if ((!textbelt || textbelt.accepted < smsRecipients.length) && process.env.MSG91_AUTH_KEY && process.env.MSG91_TEMPLATE_ID && smsRecipients.length) {
-    const variable = process.env.MSG91_MESSAGE_VARIABLE || "BEACON_MESSAGE";
-    try {
-      const response = await fetch("https://control.msg91.com/api/v5/flow/", { method: "POST", signal: AbortSignal.timeout(6_000), headers: { authkey: process.env.MSG91_AUTH_KEY, "Content-Type": "application/json", accept: "application/json" }, body: JSON.stringify({ template_id: process.env.MSG91_TEMPLATE_ID, short_url: "0", recipients: smsRecipients.map((mobiles) => ({ mobiles, [variable]: `${notification.title || "BEACON update"}: ${notification.body || "Open BEACON for details."}`.slice(0, 320) })) }) });
-      externalDelivered ||= response.ok;
-      attempts.push({ id: id("del"), entityType, entityId, channel: "sms/msg91", status: response.ok ? "delivered" : "failed", detail: response.ok ? `Accepted for ${smsRecipients.length} configured test recipient(s)` : `MSG91 returned HTTP ${response.status}` });
-    } catch { attempts.push({ id: id("del"), entityType, entityId, channel: "sms/msg91", status: "failed", detail: "MSG91 request failed; no credential or recipient detail logged" }); }
-  } else attempts.push({ id: id("del"), entityType, entityId, channel: "sms/msg91", status: textbelt?.accepted === smsRecipients.length && smsRecipients.length ? "not_needed" : "not_configured", detail: textbelt?.accepted === smsRecipients.length && smsRecipients.length ? "Textbelt accepted all configured test recipients" : process.env.MSG91_AUTH_KEY ? "MSG91 template/test recipients are incomplete; outbound delivery restricted to test recipients" : "MSG91_AUTH_KEY is not set" });
-  attempts.push({ id: id("del"), entityType, entityId, channel: "store-and-forward", status: connected || externalDelivered ? "not_needed" : "queued", detail: connected || externalDelivered ? "At least one delivery path accepted the update" : "Retained for authenticated reconnect delivery" });
+  attempts.push({ id: id("del"), entityType, entityId, channel: "official-feed/reconnect", status: externalDelivered ? "not_needed" : "available", detail: externalDelivered ? "A live notification path accepted the update" : "Verified content remains available from the API when the citizen app reconnects" });
   await db.insert(s.deliveryAttempts).values(attempts);
 }
 
@@ -356,8 +383,8 @@ app.get("/api/v1", async () => ({
 
 app.get("/api/v1/health", async () => {
   const pg = await pool.query("SELECT PostGIS_Version() AS postgis");
-  const redisPing = await redis.ping();
-  return { status: "ready", database: "postgresql/postgis", postgis: pg.rows[0].postgis, redis: redisPing, realtime_clients: sockets.size, services: serviceReadiness(), time: new Date().toISOString() };
+  const redisPing = await redis.ping().catch(() => "DEGRADED");
+  return { status: redisPing === "PONG" ? "ready" : "degraded", database: "postgresql/postgis", postgis: pg.rows[0].postgis, redis: redisPing, realtime_clients: sockets.size, services: serviceReadiness(), time: new Date().toISOString() };
 });
 
 app.get("/api/v1/ws", { websocket: true }, async (socket: any, request: any) => {
@@ -367,6 +394,7 @@ app.get("/api/v1/ws", { websocket: true }, async (socket: any, request: any) => 
   socket.send(JSON.stringify({ event: "connected", payload: { at: new Date().toISOString(), transport: "redis-websocket", audience: principal.kind } }));
   socket.on("message", (raw: Buffer) => { if (raw.toString() === "ping") socket.send(JSON.stringify({ event: "pong", payload: { at: new Date().toISOString() } })); });
   socket.on("close", () => sockets.delete(socket));
+  socket.on("error", () => sockets.delete(socket));
 });
 
 app.post("/api/v1/citizens/session", async (request: any, reply) => {
@@ -418,10 +446,17 @@ app.post("/api/v1/extension/fact-check", async (request: any, reply) => {
   const match = String(body.image || "").match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/);
   if (!match) return safeError(reply, 400, "A JPEG, PNG, or WebP screenshot is required");
   if (match[2].length > 10_000_000) return safeError(reply, 413, "Screenshot is too large");
+  const cacheKey = `extension-fact-check:${createHash("sha256").update(match[2]).digest("hex")}`;
+  const cached = await redis.get(cacheKey).catch(() => null);
+  if (cached) {
+    try { return { ...JSON.parse(cached), cached: true }; } catch { /* refresh malformed cache */ }
+  }
   const analysis = await analyzeExtensionScreenshot({ mime: match[1], data: match[2] }, String(body.page_title || "").slice(0, 300));
   const verification = await verifyClaim(analysis.result.search_query);
   const verdict = verification.verdict === "Corroborating coverage" ? "Unverified" : verification.verdict === "Insufficient external evidence" ? "Unverified" : verification.verdict;
-  return { ok: true, claim: analysis.result.claim, verdict, reasoning: `${analysis.result.reasoning} ${verification.summary}`, sources: verification.sources, tone: verdict === "Contradicted" ? "red" : verdict === "Supported" ? "teal" : "amber", confidence: verification.confidence, confidence_basis: verification.confidence_basis, provider: `${analysis.provider} · ${verification.providers.join(" + ") || "external checks unavailable"}`, errors: [...analysis.errors, ...verification.errors], human_review_required: true };
+  const result = { ok: true, claim: analysis.result.claim, verdict, reasoning: `${analysis.result.reasoning} ${verification.summary}`, sources: verification.sources, tone: verdict === "Contradicted" ? "red" : verdict === "Supported" ? "teal" : "amber", confidence: verification.confidence, confidence_basis: verification.confidence_basis, provider: `${analysis.provider} · ${verification.providers.join(" + ") || "external checks unavailable"}`, errors: [...analysis.errors, ...verification.errors], human_review_required: true };
+  await redis.set(cacheKey, JSON.stringify(result), "EX", 600).catch(() => undefined);
+  return result;
 });
 
 app.post("/api/v1/authority/login", async (request: any, reply) => {
@@ -439,13 +474,14 @@ app.get("/api/v1/context", async (request: any) => {
   const parsed = coordinateSchema.safeParse({ latitude: request.query?.lat ?? 21.2514, longitude: request.query?.lon ?? 81.6296 });
   const { latitude: lat, longitude: lon } = parsed.success ? parsed.data : { latitude: 21.2514, longitude: 81.6296 };
   const key = `weather:${lat.toFixed(2)}:${lon.toFixed(2)}`;
-  let weather = JSON.parse((await redis.get(key)) || "null");
+  let weather: any = null;
+  try { weather = JSON.parse((await redis.get(key)) || "null"); } catch { weather = null; }
   if (!weather) {
     try {
       const response = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,precipitation,wind_speed_10m&timezone=auto`, { signal: AbortSignal.timeout(3500) });
       const current = (await response.json() as any).current;
       weather = { temperature: current.temperature_2m, wind_speed: current.wind_speed_10m, precipitation: current.precipitation, risk: current.precipitation >= 10 ? "Elevated" : "Low", source: "Open-Meteo", observed_at: current.time };
-      await redis.set(key, JSON.stringify(weather), "EX", 300);
+      await redis.set(key, JSON.stringify(weather), "EX", 300).catch(() => undefined);
     } catch { weather = { temperature: null, wind_speed: null, precipitation: null, risk: "Unknown", source: "weather temporarily unavailable", observed_at: null, stale: true }; }
   }
   const [allFacilities, activeAlerts, unverified, verifiedIncidents] = await Promise.all([
@@ -516,28 +552,38 @@ app.post("/api/v1/reports", async (request: any, reply) => {
   }
   const body = parseBody(reportFieldsSchema, fields, reply);
   if (!body) return;
+  if (pendingMedia.length !== body.evidence_count)
+    return safeError(reply, 422, `Expected ${body.evidence_count} evidence file(s), received ${pendingMedia.length}`);
   const { citizen_id: citizenId, hazard_type: hazardType, severity, text, latitude, longitude } = body;
   if (!(await requireCitizen(request, reply, citizenId))) return;
   const [citizen] = await db.select({ id: s.citizens.id, name: s.citizens.name, language: s.citizens.language }).from(s.citizens).where(eq(s.citizens.id, citizenId)).limit(1);
   if (!citizen) return safeError(reply, 404, "Citizen session not found");
   const storedMedia = await Promise.all(pendingMedia.map(async (item) => {
     const stored = await storeMedia(item.buffer, item.name, item.mime);
-    if (stored.resourceType !== "audio") return stored;
-    const transcript = await transcribeAudio(item.buffer, stored.mimeType, item.name);
     return {
       ...stored,
-      transcriptOriginal: transcript.transcript_original,
-      detectedLanguage: transcript.detected_language,
-      translationEn: transcript.translation_en,
-      transcriptionProvider: transcript.provider,
-      transcriptionAvailable: transcript.available,
-      transcriptionErrors: transcript.errors,
+      transcriptOriginal: undefined as string | undefined,
+      detectedLanguage: undefined as string | undefined,
+      translationEn: undefined as string | undefined,
+      transcriptionProvider: stored.resourceType === "audio" ? "queued" : undefined,
+      transcriptionAvailable: stored.resourceType === "audio" ? false : undefined,
+      transcriptionErrors: stored.resourceType === "audio" ? [] as string[] : undefined,
     };
   }));
   const nearby = await pool.query(`SELECT * FROM incidents WHERE hazard_type=$1 AND created_at > now()-($4::text || ' hours')::interval AND ST_DWithin(location::geography, ST_SetSRID(ST_MakePoint($2,$3),4326)::geography, $5) ORDER BY created_at DESC LIMIT 8`, [hazardType, longitude, latitude, config.clustering.windowHours, config.clustering.distanceMeters]);
   let best: { row: any; similarity: number; mediaHashMatch: boolean } | undefined;
+  const nearbyIds = nearby.rows.map((row: any) => String(row.id));
+  const nearbyReports = nearbyIds.length
+    ? await db.select({ incidentId: s.reports.incidentId, originalText: s.reports.originalText, media: s.reports.media }).from(s.reports).where(inArray(s.reports.incidentId, nearbyIds))
+    : [];
+  const nearbyReportsByIncident = new Map<string, typeof nearbyReports>();
+  for (const relatedReport of nearbyReports) {
+    const grouped = nearbyReportsByIncident.get(relatedReport.incidentId) || [];
+    grouped.push(relatedReport);
+    nearbyReportsByIncident.set(relatedReport.incidentId, grouped);
+  }
   for (const row of nearby.rows) {
-    const related = await db.select({ originalText: s.reports.originalText, media: s.reports.media }).from(s.reports).where(eq(s.reports.incidentId, row.id));
+    const related = nearbyReportsByIncident.get(row.id) || [];
     const similarity = Math.max(0, ...related.map((report) => textSimilarity(text, report.originalText)));
     const previousHashes = new Set(related.flatMap((report) => Array.isArray(report.media) ? (report.media as any[]).map((item) => item.sha256) : []));
     const mediaHashMatch = storedMedia.some((item) => previousHashes.has(item.sha256));
@@ -547,8 +593,8 @@ app.post("/api/v1/reports", async (request: any, reply) => {
   const reportLanguage = body.language || citizen.language;
   const redactedForProviders = redactPII(text, [citizen.name]).text;
   const translation = await translateText(redactedForProviders, reportLanguage, "en");
-  const verification = await verifyClaim(translation.text);
-  const analysis = await analyzeReport({ text, hazardType, severity, language: reportLanguage, citizenName: citizen.name, translation, verification, duplicate: { nearbyCount: nearby.rowCount || 0, textSimilarity: best?.similarity || 0, mediaHashMatch: best?.mediaHashMatch || false } });
+  const analysisInput = { text, hazardType, severity, language: reportLanguage, citizenName: citizen.name, translation, duplicate: { nearbyCount: nearby.rowCount || 0, textSimilarity: best?.similarity || 0, mediaHashMatch: best?.mediaHashMatch || false } };
+  const analysis = await analyzeReport(analysisInput, { cloud: false });
   let incident: any;
   if (match) {
     const count = match.row.report_count + 1;
@@ -578,9 +624,30 @@ app.post("/api/v1/reports", async (request: any, reply) => {
   await db.insert(s.reports).values({ id: reportId, citizenId, incidentId: incident.id, hazardType, severity, originalText: text, translatedText: analysis.result.translation_en, requestedHelp: body.requested_help || null, latitude, longitude, approximateArea: publicArea(latitude, longitude), trustState: "Unverified", media });
   if (storedMedia.length) await db.insert(s.mediaEvidence).values(storedMedia.map((item) => ({ id: id("med"), reportId, provider: item.provider, storageKey: item.storageKey, url: item.url, secureUrl: item.secureUrl, originalName: item.originalName, mimeType: item.mimeType, resourceType: item.resourceType, bytes: item.bytes, sha256: item.sha256, fallbackReason: item.fallbackReason })));
   await pool.query("UPDATE reports SET location=ST_SetSRID(ST_MakePoint(longitude,latitude),4326) WHERE id=$1", [reportId]);
-  await db.insert(s.analysisRuns).values({ id: id("ana"), incidentId: incident.id, provider: analysis.meta.provider, latencyMs: analysis.meta.latency_ms, confidence: analysis.meta.confidence, result: analysis.result, errors: analysis.meta.errors, fallbackPath: analysis.meta.fallback_path });
+  const analysisRunId = id("ana");
+  await db.insert(s.analysisRuns).values({ id: analysisRunId, incidentId: incident.id, provider: analysis.meta.provider, latencyMs: analysis.meta.latency_ms, confidence: analysis.meta.confidence, result: analysis.result, errors: analysis.meta.errors, fallbackPath: analysis.meta.fallback_path });
   await audit(citizenId, "report_created", "report", reportId, undefined, { incident_id: incident.id, media_count: storedMedia.length, ai_provider: analysis.meta.provider, ai_redactions: analysis.meta.redactions });
   await emit(match ? "incident.updated" : "incident.created", incident);
+  void (async () => {
+    const verification = await verifyClaim(translation.text);
+    const enriched = await analyzeReport({ ...analysisInput, verification });
+    await Promise.all([
+      db.update(s.analysisRuns).set({ provider: enriched.meta.provider, latencyMs: enriched.meta.latency_ms, confidence: enriched.meta.confidence, result: enriched.result, errors: enriched.meta.errors, fallbackPath: enriched.meta.fallback_path }).where(eq(s.analysisRuns.id, analysisRunId)),
+      db.update(s.incidents).set({ analysisSummary: enriched.result.summary, updatedAt: new Date() }).where(eq(s.incidents.id, incident.id)),
+    ]);
+    await emit("incident.analysis.updated", { incident_id: incident.id, analysis: enriched.result, provider: enriched.meta.provider }, { kind: "authority" });
+  })().catch((error) => app.log.warn({ err: error, reportId }, "Background report analysis failed; deterministic analysis retained"));
+  void Promise.allSettled(storedMedia.map(async (item, index) => {
+    if (item.resourceType !== "audio") return;
+    const transcript = await transcribeAudio(pendingMedia[index].buffer, item.mimeType, item.originalName);
+    const [current] = await db.select({ media: s.reports.media }).from(s.reports).where(eq(s.reports.id, reportId)).limit(1);
+    const nextMedia = Array.isArray(current?.media) ? [...current.media as any[]] : [];
+    const mediaIndex = nextMedia.findIndex((entry: any) => entry.sha256 === item.sha256);
+    if (mediaIndex < 0) return;
+    nextMedia[mediaIndex] = { ...nextMedia[mediaIndex], transcript_original: transcript.transcript_original, detected_language: transcript.detected_language, translation_en: transcript.translation_en, transcription_provider: transcript.provider, transcription_available: transcript.available, transcription_errors: transcript.errors };
+    await db.update(s.reports).set({ media: nextMedia }).where(eq(s.reports.id, reportId));
+    await emit("report.audio.transcribed", { report_id: reportId, media_index: mediaIndex }, { kind: "authority" });
+  })).catch((error) => app.log.warn({ err: error, reportId }, "Background audio transcription failed"));
   return { report_id: reportId, incident: snake(incident), media, analysis: analysis.result, analysis_meta: { provider: analysis.meta.provider, latency_ms: analysis.meta.latency_ms, fallback_path: analysis.meta.fallback_path, errors: analysis.meta.errors } };
 });
 
@@ -632,12 +699,30 @@ app.post("/api/v1/sos/:id/cancel", async (request: any, reply) => {
 app.get("/api/v1/authority/queue", async (request, reply) => {
   if (!(await requireOfficial(request, reply))) return;
   const [incidentRows, sosRows, assignmentRows, alertRows, deliveryRows, communityRows] = await Promise.all([
-    db.select().from(s.incidents).orderBy(sql`CASE lower(${s.incidents.severity}) WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'moderate' THEN 2 ELSE 3 END`, sql`CASE ${s.incidents.trustState} WHEN 'Corroborated' THEN 0 WHEN 'Unverified' THEN 1 WHEN 'Verified' THEN 2 ELSE 3 END`, desc(s.incidents.createdAt)),
-    db.select().from(s.sosRequests).where(inArray(s.sosRequests.status, ["New", "Acknowledged", "Assigned", "En route"])).orderBy(sql`CASE ${s.sosRequests.status} WHEN 'New' THEN 0 WHEN 'Acknowledged' THEN 1 WHEN 'Assigned' THEN 2 ELSE 3 END`, desc(s.sosRequests.createdAt)),
-    db.select().from(s.assignments).orderBy(desc(s.assignments.createdAt)), db.select().from(s.alerts).orderBy(desc(s.alerts.publishedAt)), db.select().from(s.deliveryAttempts).orderBy(desc(s.deliveryAttempts.createdAt)).limit(100), db.select().from(s.communities).orderBy(desc(s.communities.createdAt)),
+    db.select().from(s.incidents).orderBy(sql`CASE lower(${s.incidents.severity}) WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'moderate' THEN 2 ELSE 3 END`, sql`CASE ${s.incidents.trustState} WHEN 'Corroborated' THEN 0 WHEN 'Unverified' THEN 1 WHEN 'Verified' THEN 2 ELSE 3 END`, desc(s.incidents.createdAt)).limit(200),
+    db.select().from(s.sosRequests).where(inArray(s.sosRequests.status, ["New", "Acknowledged", "Assigned", "En route"])).orderBy(sql`CASE ${s.sosRequests.status} WHEN 'New' THEN 0 WHEN 'Acknowledged' THEN 1 WHEN 'Assigned' THEN 2 ELSE 3 END`, desc(s.sosRequests.createdAt)).limit(200),
+    db.select().from(s.assignments).orderBy(desc(s.assignments.createdAt)).limit(500), db.select().from(s.alerts).orderBy(desc(s.alerts.publishedAt)).limit(200), db.select().from(s.deliveryAttempts).orderBy(desc(s.deliveryAttempts.createdAt)).limit(100), db.select().from(s.communities).orderBy(desc(s.communities.createdAt)).limit(200),
   ]);
-  const enriched = await Promise.all(incidentRows.map(async (incident) => ({ ...incident, reports: await db.select().from(s.reports).where(eq(s.reports.incidentId, incident.id)).orderBy(desc(s.reports.createdAt)), analysis: (await db.select().from(s.analysisRuns).where(eq(s.analysisRuns.incidentId, incident.id)).orderBy(desc(s.analysisRuns.createdAt)).limit(1))[0] })));
+  const incidentIds = incidentRows.map((incident) => incident.id);
+  const [reportRows, analysisRows] = incidentIds.length
+    ? await Promise.all([
+        db.select().from(s.reports).where(inArray(s.reports.incidentId, incidentIds)).orderBy(desc(s.reports.createdAt)),
+        db.select().from(s.analysisRuns).where(inArray(s.analysisRuns.incidentId, incidentIds)).orderBy(desc(s.analysisRuns.createdAt)),
+      ])
+    : [[], []];
+  const reportsByIncident = new Map<string, typeof reportRows>();
+  const latestAnalysis = new Map<string, (typeof analysisRows)[number]>();
+  for (const report of reportRows) {
+    const existing = reportsByIncident.get(report.incidentId) || [];
+    existing.push(report);
+    reportsByIncident.set(report.incidentId, existing);
+  }
+  for (const analysis of analysisRows) {
+    if (!latestAnalysis.has(analysis.incidentId)) latestAnalysis.set(analysis.incidentId, analysis);
+  }
+  const enriched = incidentRows.map((incident) => ({ ...incident, reports: reportsByIncident.get(incident.id) || [], analysis: latestAnalysis.get(incident.id) }));
   const smsRecipients = configuredSmsRecipients();
+  const connectedCitizenDevices = new Set([...sockets.values()].filter((principal) => principal.kind === "citizen").map((principal) => principal.id)).size;
   return snake({
     incidents: enriched,
     sos: sosRows,
@@ -645,6 +730,13 @@ app.get("/api/v1/authority/queue", async (request, reply) => {
     alerts: alertRows,
     delivery: deliveryRows,
     communities: communityRows,
+    notifications: {
+      provider: "Android notification bar via authenticated realtime",
+      configured: true,
+      connectedDeviceCount: connectedCitizenDevices,
+      permissionManagedOnDevice: true,
+      maxMessageChars: 500,
+    },
     sms: {
       provider: "Textbelt (self-hosted)",
       channel: "sms/textbelt",
@@ -654,6 +746,26 @@ app.get("/api/v1/authority/queue", async (request, reply) => {
       maxMessageChars: 280,
     },
   });
+});
+
+app.post("/api/v1/authority/notifications", async (request: any, reply) => {
+  const user = await requireOfficial(request, reply, "admin");
+  if (!user || !("id" in user)) return;
+  const title = String(request.body?.title || "BEACON safety update").trim().slice(0, 80);
+  const message = String(request.body?.message || "").trim();
+  if (title.length < 3) return safeError(reply, 400, "Notification title must contain at least 3 characters");
+  if (message.length < 8 || message.length > 500) return safeError(reply, 400, "Notification message must contain 8 to 500 characters");
+  const notificationId = id("ntf");
+  const connectedCitizenDevices = new Set([...sockets.values()].filter((principal) => principal.kind === "citizen").map((principal) => principal.id)).size;
+  const status = connectedCitizenDevices ? "accepted" : "not_connected";
+  const detail = connectedCitizenDevices
+    ? `Sent to ${connectedCitizenDevices} connected citizen device(s); Android controls notification-bar presentation`
+    : "No citizen device is connected. Open the BEACON app on the phone and retry.";
+  const payload = { id: notificationId, title, body: message, incident_id: request.body?.incident_id || null, created_at: new Date().toISOString(), official: true };
+  await db.insert(s.deliveryAttempts).values({ id: id("del"), entityType: "authority_notification", entityId: notificationId, channel: "notification/realtime-local", status, detail });
+  await audit(user.id, "notification_sent", "authority_notification", notificationId, undefined, { title, incident_id: payload.incident_id, connected_device_count: connectedCitizenDevices });
+  await emit("authority.notification", payload, { kind: "authenticated" });
+  return reply.code(connectedCitizenDevices ? 201 : 202).send(snake({ id: notificationId, status, detail, connectedDeviceCount: connectedCitizenDevices }));
 });
 
 app.post("/api/v1/authority/sms", async (request: any, reply) => {
@@ -713,6 +825,20 @@ app.post("/api/v1/incidents/:id/source-check", async (request: any, reply) => {
   await audit(user.id, "external_source_check_refreshed", "incident", request.params.id, undefined, { verdict: verification.verdict, source_count: verification.sources.length, providers: verification.providers });
   await emit("incident.verification", { incident_id: request.params.id, verification });
   return verification;
+});
+
+app.delete("/api/v1/reports/:id", async (request: any, reply) => {
+  const user = await requireOfficial(request, reply, "admin"); if (!user || !("id" in user)) return;
+  const reason = String(request.body?.reason || "").trim();
+  if (reason.length < 5) return safeError(reply, 400, "A deletion reason of at least 5 characters is required");
+  const [report] = await db.select().from(s.reports).where(eq(s.reports.id, request.params.id)).limit(1);
+  if (!report) return safeError(reply, 404, "Report not found");
+  await db.delete(s.reports).where(eq(s.reports.id, report.id));
+  const remaining = await db.select({ id: s.reports.id }).from(s.reports).where(eq(s.reports.incidentId, report.incidentId));
+  await db.update(s.incidents).set({ reportCount: remaining.length, status: remaining.length ? "New" : "No active reports", updatedAt: new Date() }).where(eq(s.incidents.id, report.incidentId));
+  await audit(user.id, "report_deleted", "report", report.id, reason, { incident_id: report.incidentId, retained_incident: true, remaining_reports: remaining.length });
+  await emit("report.deleted", { report_id: report.id, incident_id: report.incidentId }, { kind: "authenticated" });
+  return { ok: true, report_id: report.id, incident_id: report.incidentId };
 });
 
 app.post("/api/v1/incidents/:id/decision", async (request: any, reply) => {
@@ -820,14 +946,29 @@ app.patch("/api/v1/facilities/:id", async (request: any, reply) => {
 
 app.get("/api/v1/communities", async (request: any) => {
   const principal = await resolvePrincipal(request.headers.authorization?.replace("Bearer ", ""));
+  const authorityView = principal?.kind === "official";
   let targetLanguage = "en";
   if (principal?.kind === "citizen") {
     const [citizen] = await db.select({ language: s.citizens.language }).from(s.citizens).where(eq(s.citizens.id, principal.id)).limit(1);
     if (citizen && supportedLanguageCodes.has(citizen.language as any)) targetLanguage = citizen.language;
   }
-  const result = await db.select().from(s.communities).where(and(eq(s.communities.approved, true), eq(s.communities.status, "approved"))).orderBy(desc(s.communities.createdAt));
+  const result = authorityView
+    ? await db.select().from(s.communities).orderBy(desc(s.communities.createdAt))
+    : await db.select().from(s.communities).where(and(eq(s.communities.approved, true), eq(s.communities.status, "approved"))).orderBy(desc(s.communities.createdAt));
+  const communityIds = result.map((community) => community.id);
+  const allMessages = communityIds.length
+    ? await (authorityView
+        ? db.select().from(s.messages).where(inArray(s.messages.communityId, communityIds)).orderBy(s.messages.createdAt).limit(2_000)
+        : db.select().from(s.messages).where(and(inArray(s.messages.communityId, communityIds), eq(s.messages.moderationStatus, "visible"))).orderBy(s.messages.createdAt).limit(2_000))
+    : [];
+  const messagesByCommunity = new Map<string, typeof allMessages>();
+  for (const message of allMessages) {
+    const grouped = messagesByCommunity.get(message.communityId) || [];
+    grouped.push(message);
+    messagesByCommunity.set(message.communityId, grouped);
+  }
   return snake(await Promise.all(result.map(async (community) => {
-    const messages = await db.select().from(s.messages).where(and(eq(s.messages.communityId, community.id), eq(s.messages.moderationStatus, "visible"))).orderBy(s.messages.createdAt);
+    const messages = (messagesByCommunity.get(community.id) || []).slice(-100);
     return { ...community, messages: await Promise.all(messages.map((message) => localizeCommunityMessage(message, targetLanguage))) };
   })));
 });
@@ -855,7 +996,7 @@ app.patch("/api/v1/communities/:id/status", async (request: any, reply) => {
         : [];
       const mapUrl = `https://www.openstreetmap.org/?mlat=${incident.latitude}&mlon=${incident.longitude}#map=15/${incident.latitude}/${incident.longitude}`;
       const body = [`Official room opened for ${incident.approximateArea}.`, `Map: ${mapUrl}`, `AI advisory: ${incident.analysisSummary}`, ...sourceLinks.map((source: string) => `Related source: ${source}`), "Follow authority instructions; related coverage is context, not proof."].join("\n");
-      const [welcome] = await db.insert(s.messages).values({ id: id("msg"), communityId: updated.id, senderName: user.name, senderRole: user.role, body, sourceLanguage: "en", official: true, moderationStatus: "visible" }).returning();
+      const [welcome] = await db.insert(s.messages).values({ id: id("msg"), communityId: updated.id, senderId: user.id, senderName: user.name, senderRole: user.role, body, sourceLanguage: "en", official: true, moderationStatus: "visible" }).returning();
       await emit("community.message", welcome, { kind: "authenticated" });
     }
   }
@@ -876,10 +1017,12 @@ app.post("/api/v1/communities/:id/messages", async (request: any, reply) => {
     const [citizen] = await db.select({ name: s.citizens.name, language: s.citizens.language }).from(s.citizens).where(eq(s.citizens.id, principal.id)).limit(1);
     if (!citizen) return safeError(reply, 401, "Citizen session required");
     senderName = citizen.name; role = "citizen"; sourceLanguage = citizen.language;
+    const [ban] = await db.select({ id: s.communityBans.id }).from(s.communityBans).where(and(eq(s.communityBans.communityId, request.params.id), eq(s.communityBans.citizenId, principal.id))).limit(1);
+    if (ban) return safeError(reply, 403, "You have been removed from this community by an authority moderator");
   }
   const [community] = await db.select().from(s.communities).where(eq(s.communities.id, request.params.id)).limit(1);
   if (!community || !community.approved || community.status !== "approved") return safeError(reply, 409, "Community is not open for messages");
-  const [created] = await db.insert(s.messages).values({ id: id("msg"), communityId: request.params.id, senderName, senderRole: role, body: body.body, sourceLanguage, official: principal.kind === "official", moderationStatus: "visible" }).returning();
+  const [created] = await db.insert(s.messages).values({ id: id("msg"), communityId: request.params.id, senderId: principal.id, senderName, senderRole: role, body: body.body, sourceLanguage, official: principal.kind === "official", moderationStatus: "visible" }).returning();
   await emit("community.message", created, { kind: "authenticated" }); return snake(created);
 });
 
@@ -891,6 +1034,46 @@ app.patch("/api/v1/communities/:id/messages/:messageId/moderate", async (request
   await audit(user.id, `message_${status}`, "message", updated.id, request.body.reason, { community_id: request.params.id }); await emit("community.message.moderated", { community_id: request.params.id, message_id: updated.id, status }, { kind: "authenticated" }); return snake(updated);
 });
 
+app.delete("/api/v1/communities/:id/messages/:messageId", async (request: any, reply) => {
+  const user = await requireOfficial(request, reply, "admin"); if (!user || !("id" in user)) return;
+  const reason = String(request.body?.reason || "").trim();
+  if (reason.length < 5) return safeError(reply, 400, "A moderation reason is required");
+  const [updated] = await db.update(s.messages).set({ moderationStatus: "deleted", body: "[Message deleted by authority]", translations: {} }).where(and(eq(s.messages.id, request.params.messageId), eq(s.messages.communityId, request.params.id))).returning();
+  if (!updated) return safeError(reply, 404, "Community message not found");
+  await audit(user.id, "message_deleted", "message", updated.id, reason, { community_id: request.params.id, sender_id: updated.senderId });
+  await emit("community.message.deleted", { community_id: request.params.id, message_id: updated.id }, { kind: "authenticated" });
+  return snake(updated);
+});
+
+app.delete("/api/v1/communities/:id/members/:citizenId", async (request: any, reply) => {
+  const user = await requireOfficial(request, reply, "admin"); if (!user || !("id" in user)) return;
+  const reason = String(request.body?.reason || "").trim();
+  if (reason.length < 5) return safeError(reply, 400, "A removal reason is required");
+  const [citizen] = await db.select({ id: s.citizens.id, name: s.citizens.name }).from(s.citizens).where(eq(s.citizens.id, request.params.citizenId)).limit(1);
+  if (!citizen) return safeError(reply, 404, "Community member not found");
+  await db.insert(s.communityBans).values({ id: id("ban"), communityId: request.params.id, citizenId: citizen.id, reason, actorId: user.id }).onConflictDoUpdate({ target: [s.communityBans.communityId, s.communityBans.citizenId], set: { reason, actorId: user.id } });
+  await db.update(s.messages).set({ moderationStatus: "hidden" }).where(and(eq(s.messages.communityId, request.params.id), eq(s.messages.senderId, citizen.id), eq(s.messages.official, false)));
+  await audit(user.id, "community_member_removed", "citizen", citizen.id, reason, { community_id: request.params.id, citizen_name: citizen.name });
+  await emit("community.member.removed", { community_id: request.params.id, citizen_id: citizen.id }, { kind: "authenticated" });
+  return { ok: true, citizen_id: citizen.id };
+});
+
+app.delete("/api/v1/communities/:id", async (request: any, reply) => {
+  const user = await requireOfficial(request, reply, "admin"); if (!user || !("id" in user)) return;
+  const reason = String(request.body?.reason || "").trim();
+  if (reason.length < 5) return safeError(reply, 400, "A deletion reason is required");
+  const [community] = await db.select().from(s.communities).where(eq(s.communities.id, request.params.id)).limit(1);
+  if (!community) return safeError(reply, 404, "Community not found");
+  await db.transaction(async (tx) => {
+    await tx.delete(s.messages).where(eq(s.messages.communityId, community.id));
+    await tx.delete(s.communityBans).where(eq(s.communityBans.communityId, community.id));
+    await tx.delete(s.communities).where(eq(s.communities.id, community.id));
+  });
+  await audit(user.id, "community_deleted", "community", community.id, reason, { name: community.name, incident_id: community.incidentId });
+  await emit("community.deleted", { community_id: community.id }, { kind: "authenticated" });
+  return { ok: true, community_id: community.id };
+});
+
 app.get("/api/v1/audit", async (request, reply) => { if (!(await requireOfficial(request, reply, "admin"))) return; return snake(await db.select().from(s.auditEvents).orderBy(desc(s.auditEvents.createdAt)).limit(100)); });
 
 app.post("/api/v1/demo/reset", async (request, reply) => {
@@ -898,25 +1081,25 @@ app.post("/api/v1/demo/reset", async (request, reply) => {
   // A demo reset clears operational data, not registered devices. Keeping citizen
   // sessions prevents a judge reset from silently breaking an already-open phone.
   await pool.query("TRUNCATE delivery_attempts, corrections, messages, communities, assignments, sos_requests, analysis_runs, reports, alerts, incidents, audit_events RESTART IDENTITY CASCADE");
-  const cacheKeys = (await redis.keys("weather:*")).concat(await redis.keys("rate:*"));
-  if (cacheKeys.length) await redis.del(...cacheKeys);
+  const cacheKeys = await Promise.all([redis.keys("weather:*").catch((): string[] => []), redis.keys("rate:*").catch((): string[] => [])]).then(([weatherKeys, rateKeys]) => weatherKeys.concat(rateKeys));
+  if (cacheKeys.length) await redis.del(...cacheKeys).catch(() => undefined);
   await emit("demo.reset", { actor: user.id }); return { ok: true };
 });
 
 async function start() {
   await mkdir(config.uploadDir, { recursive: true });
-  await redis.connect(); await subscriber.connect(); await ensureSchema(); await seed();
-  await subscriber.subscribe(EVENT_CHANNEL);
+  pool.on("error", (error) => app.log.error({ err: error }, "Idle PostgreSQL client error"));
+  redis.on("error", (error) => app.log.warn({ err: error }, "Redis command connection error"));
+  subscriber.on("error", (error) => app.log.warn({ err: error }, "Redis subscriber connection error"));
+  subscriber.on("ready", () => subscriber.subscribe(EVENT_CHANNEL).catch((error) => app.log.warn({ err: error }, "Redis subscription failed")));
   subscriber.on("message", (_channel: string, message: string) => {
     let envelope: any;
     try { envelope = JSON.parse(message); } catch { return; }
-    const audience = envelope.audience as Audience | undefined;
-    const outbound = JSON.stringify({ event: envelope.event, payload: envelope.payload, at: envelope.at });
-    for (const [socket, principal] of sockets) {
-      const allowed = (!audience && principal.kind === "official") || audience?.kind === "authenticated" || (audience?.kind === "authority" && principal.kind === "official") || (audience?.kind === "citizen" && (principal.kind === "official" || principal.id === audience.citizenId));
-      if (allowed && socket.readyState === 1) socket.send(outbound);
-    }
+    if (envelope.origin === INSTANCE_ID) return;
+    broadcast(envelope);
   });
+  await Promise.allSettled([redis.connect(), subscriber.connect()]);
+  await ensureSchema(); await seed();
   await app.listen({ port: config.port, host: config.host });
 }
 

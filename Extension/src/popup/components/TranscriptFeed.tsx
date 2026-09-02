@@ -4,6 +4,7 @@ import type { TranscriptUpdatePayload } from '../../types'
 interface TranscriptFeedProps {
   transcripts: TranscriptUpdatePayload[]
   translatingLabel: string
+  expanded?: boolean
   // Karaoke: original transcription of the line currently being read aloud.
   speakingOriginal: string | null
 }
@@ -12,6 +13,7 @@ export function TranscriptFeed({
   transcripts,
   translatingLabel,
   speakingOriginal,
+  expanded = false,
 }: TranscriptFeedProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const speakingRef = useRef<HTMLDivElement>(null)
@@ -41,7 +43,11 @@ export function TranscriptFeed({
   return (
     <div
       ref={containerRef}
-      className="transcript-feed relative flex min-h-0 w-full flex-1 flex-col gap-2 overflow-y-auto rounded-xl border border-[var(--border-color)] bg-[var(--surface-elevated)] p-3 text-left"
+      className={`transcript-feed relative flex w-full flex-col gap-2 overflow-y-auto rounded-xl border border-[var(--border-color)] bg-[var(--surface-elevated)] p-3 text-left ${
+        expanded ? 'min-h-52 flex-1' : 'h-28 min-h-28 max-h-36 flex-none'
+      }`}
+      aria-live="polite"
+      aria-label="Live transcript"
     >
       {transcripts.length === 0 ? (
         <p className="text-caption text-muted">···</p>
@@ -52,20 +58,20 @@ export function TranscriptFeed({
             <div
               key={i}
               ref={isSpeaking ? speakingRef : undefined}
-              className={`flex animate-fade-in flex-col gap-0.5 rounded-lg px-2 py-1 transition-colors ${
+              className={`flex animate-fade-in flex-none flex-col gap-1 rounded-lg px-2 py-1.5 transition-colors ${
                 isSpeaking ? 'bg-brand-teal/10' : i === transcripts.length - 1 ? '' : 'opacity-70'
               }`}
             >
-              <p className="text-caption leading-snug text-muted">{entry.original}</p>
+              <p className="text-xs leading-4 text-muted">{entry.original}</p>
               {entry.translated === null ? (
                 // Pending translation: a soft pulse instead of a label that
                 // snaps to the final text, so the transition reads as fluid.
-                <p className="animate-pulse text-body italic leading-snug text-muted">
+                <p className="animate-pulse text-sm italic leading-5 text-muted">
                   {translatingLabel}
                 </p>
               ) : (
                 <p
-                  className={`animate-fade-in text-body leading-snug ${
+                  className={`animate-fade-in text-sm leading-5 ${
                     isSpeaking ? 'font-semibold text-brand-teal' : 'text-[var(--text-primary)]'
                   }`}
                 >

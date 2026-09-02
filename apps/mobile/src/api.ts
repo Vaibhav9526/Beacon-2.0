@@ -133,11 +133,15 @@ export function reportForm(payload: ReportDraft & { citizen_id: string }) {
   form.append("requested_help", payload.requested_help);
   form.append("latitude", String(payload.coordinate.latitude));
   form.append("longitude", String(payload.coordinate.longitude));
+  form.append("evidence_count", String(payload.attachments.length));
   payload.attachments.forEach((attachment) => {
     const file = new File(attachment.uri);
     if (!file.exists || file.size <= 0)
       throw new ApiError(`${attachment.name} is empty or no longer available`, 400);
-    form.append("media", file, attachment.name);
+    // Expo 57 installs its WinterCG fetch implementation. It serializes Blob/File
+    // values by reading their bytes; React Native's legacy { uri, name, type }
+    // descriptor is explicitly unsupported by that implementation.
+    form.append("media", file);
   });
   return form;
 }
@@ -145,10 +149,13 @@ export function reportForm(payload: ReportDraft & { citizen_id: string }) {
 export async function submitReport(
   payload: ReportDraft & { citizen_id: string },
 ) {
-  return api<{ report_id: string }>("/reports", {
+  const result = await api<{ report_id: string; media: Array<{ bytes: number; url: string }> }>("/reports", {
     method: "POST",
     body: reportForm(payload),
-  }, 45_000);
+  }, 120_000);
+  if (result.media.length !== payload.attachments.length)
+    throw new ApiError("The report arrived but one or more evidence files were not retained", 502);
+  return result;
 }
 
 export async function submitSos(payload: {

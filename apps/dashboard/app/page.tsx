@@ -35,7 +35,9 @@ import {
   ShieldCheck,
   Siren,
   SlidersHorizontal,
+  Trash2,
   Users,
+  UserMinus,
   UserRoundSearch,
   Gavel,
   Video,
@@ -45,7 +47,7 @@ import {
 } from "lucide-react";
 import { BeaconMark } from "@/components/BeaconMark";
 import AuthorityLogin from "@/components/AuthorityLogin";
-import { api, authHeaders, clearAuthoritySession, getApiBase, getAuthoritySession, type AuthoritySession } from "@/lib/api";
+import { api, authHeaders, clearAuthoritySession, getApiBase, getAuthHeaders, getAuthoritySession, type AuthoritySession } from "@/lib/api";
 import { connectRealtime, type RealtimeState } from "@/lib/realtime";
 
 const MapCanvas = dynamic(() => import("@/components/MapCanvas"), {
@@ -172,6 +174,13 @@ type Queue = {
   alerts: Alert[];
   delivery?: Delivery[];
   communities?: Community[];
+  notifications?: {
+    provider: string;
+    configured: boolean;
+    connected_device_count: number;
+    permission_managed_on_device: boolean;
+    max_message_chars: number;
+  };
   sms?: {
     provider: string;
     configured: boolean;
@@ -182,11 +191,13 @@ type Queue = {
 };
 type CommunityMessage = {
   id: string;
+  sender_id?: string;
   sender_name: string;
   sender_role: string;
   body: string;
   official: number;
   status?: string;
+  moderation_status?: string;
   created_at: string;
 };
 type Community = {
@@ -342,10 +353,45 @@ function EvidenceAsset({
   reportId?: string;
 }) {
   const [failed, setFailed] = useState(false);
+  const directUrl = evidenceUrl(item);
+  const protectedLocalMedia = item.provider === "local" || Boolean(directUrl?.includes("/api/v1/media/local/"));
+  const [url, setUrl] = useState<string | null>(protectedLocalMedia ? null : directUrl);
+  const [loadingMedia, setLoadingMedia] = useState(protectedLocalMedia && Boolean(directUrl));
   const [transcription, setTranscription] = useState<MediaEvidence>(item);
   const [transcribing, setTranscribing] = useState(false);
   const [transcriptionError, setTranscriptionError] = useState("");
-  const url = evidenceUrl(item);
+  useEffect(() => {
+    setFailed(false);
+    if (!directUrl || !protectedLocalMedia) {
+      setUrl(directUrl);
+      setLoadingMedia(false);
+      return;
+    }
+    const controller = new AbortController();
+    let objectUrl: string | undefined;
+    setUrl(null);
+    setLoadingMedia(true);
+    fetch(directUrl, { headers: getAuthHeaders(false), signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Evidence HTTP ${response.status}`);
+        return response.blob();
+      })
+      .then((blob) => {
+        if (controller.signal.aborted) return;
+        objectUrl = URL.createObjectURL(blob);
+        setUrl(objectUrl);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setFailed(true);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoadingMedia(false);
+      });
+    return () => {
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [directUrl, protectedLocalMedia]);
   const mime = item.content_type || item.mime_type || "";
   const kind =
     item.resource_type ||
@@ -364,9 +410,11 @@ function EvidenceAsset({
         <span>
           <b>{name}</b>
           <small>
-            {url
-              ? "Preview failed · original remains retained"
-              : "Stored evidence · preview link unavailable"}
+            {loadingMedia
+              ? "Loading protected evidence…"
+              : url
+                ? "Preview failed · original remains retained"
+                : "Stored evidence · preview link unavailable"}
           </small>
         </span>
       </div>
@@ -538,8 +586,9 @@ export default function Dashboard() {
     [bypassReason, setBypassReason] = useState(""),
     [correction, setCorrection] = useState<Alert | null>(null),
     [moderation, setModeration] = useState<{
-      community: Community;
+      community?: Community;
       message?: CommunityMessage;
+      report?: Report;
       action: string;
     } | null>(null);
 
@@ -558,12 +607,12 @@ export default function Dashboard() {
     }
     if (contextResult.status === "fulfilled")
       setFacilities(contextResult.value.facilities || []);
-    if (queueResult.status === "fulfilled" && queueResult.value.communities?.length) {
-      setCommunities(queueResult.value.communities);
-      setSelectedCommunity((v) => v || queueResult.value.communities?.[0]?.id);
-    } else if (communityResult.status === "fulfilled") {
+    if (communityResult.status === "fulfilled") {
       setCommunities(communityResult.value);
       setSelectedCommunity((v) => v || communityResult.value[0]?.id);
+    } else if (queueResult.status === "fulfilled" && queueResult.value.communities?.length) {
+      setCommunities(queueResult.value.communities);
+      setSelectedCommunity((v) => v || queueResult.value.communities?.[0]?.id);
     }
     if (auditResult.status === "fulfilled") setAuditEvents(auditResult.value);
     const failures = results.filter(
@@ -847,14 +896,14 @@ export default function Dashboard() {
     )
       e.currentTarget.reset();
   }
-  async function sendAuthoritySms(e: FormEvent<HTMLFormElement>) {
+  async function sendAuthorityNotification(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const form = e.currentTarget;
     const fields = new FormData(form);
     setBusy(true);
     try {
       const result = await api<{ status: string; detail: string }>(
-        "/authority/sms",
+        "/authority/notifications",
         {
           method: "POST",
           headers: authHeaders,
@@ -866,7 +915,7 @@ export default function Dashboard() {
         },
       );
       setNotice({
-        tone: ["accepted", "delivered"].includes(result.status) ? "success" : "queued",
+        tone: result.status === "accepted" ? "success" : "queued",
         text: result.detail,
       });
       form.reset();
@@ -874,7 +923,7 @@ export default function Dashboard() {
     } catch (error) {
       setNotice({
         tone: "error",
-        text: error instanceof Error ? error.message : "SMS could not be queued.",
+        text: error instanceof Error ? error.message : "Notification could not be sent.",
       });
     } finally {
       setBusy(false);
@@ -884,15 +933,31 @@ export default function Dashboard() {
     e.preventDefault();
     if (!moderation) return;
     const f = new FormData(e.currentTarget);
-    const path = moderation.message
-      ? `/communities/${moderation.community.id}/messages/${moderation.message.id}/moderate`
-      : `/communities/${moderation.community.id}/status`;
+    let path: string;
+    let method = "PATCH";
+    if (moderation.report) {
+      path = `/reports/${moderation.report.id}`;
+      method = "DELETE";
+    } else if (moderation.message && moderation.community && moderation.action === "delete") {
+      path = `/communities/${moderation.community.id}/messages/${moderation.message.id}`;
+      method = "DELETE";
+    } else if (moderation.message?.sender_id && moderation.community && moderation.action === "kick") {
+      path = `/communities/${moderation.community.id}/members/${moderation.message.sender_id}`;
+      method = "DELETE";
+    } else if (moderation.community && moderation.action === "delete") {
+      path = `/communities/${moderation.community.id}`;
+      method = "DELETE";
+    } else if (moderation.message && moderation.community) {
+      path = `/communities/${moderation.community.id}/messages/${moderation.message.id}/moderate`;
+    } else if (moderation.community) {
+      path = `/communities/${moderation.community.id}/status`;
+    } else return;
     if (
       await mutate(
         path,
         { status: moderation.action, reason: f.get("reason") },
         `Moderation recorded · ${moderation.action}`,
-        "PATCH",
+        method,
       )
     )
       setModeration(null);
@@ -1086,13 +1151,14 @@ export default function Dashboard() {
             onSelectCommunity={setSelectedCommunity}
             onCreateCommunity={createCommunity}
             onPostMessage={postOfficialMessage}
-            onSendSms={sendAuthoritySms}
+            onSendNotification={sendAuthorityNotification}
             onPublish={publish}
             onDecision={decide}
             onSourceCheck={refreshSourceCheck}
             onBypass={() => setBypassOpen(true)}
             onCorrection={setCorrection}
             onModerate={setModeration}
+            isAdmin={session.user.role === "admin"}
           />
         )}
       </section>
@@ -1246,7 +1312,9 @@ export default function Dashboard() {
               <b>{moderation.action}</b>{" "}
               {moderation.message
                 ? `the message from ${moderation.message.sender_name}`
-                : moderation.community.name}
+                : moderation.report
+                  ? `report TKT-${moderation.report.id.toUpperCase()}`
+                  : moderation.community?.name}
               . This action and reason enter the authority audit trail.
             </p>
             <label>
@@ -1263,7 +1331,7 @@ export default function Dashboard() {
               <button type="button" onClick={() => setModeration(null)}>
                 Cancel
               </button>
-              <button disabled={busy} className="primary-action">
+              <button disabled={busy} className={["delete", "kick"].includes(moderation.action) ? "danger-action" : "primary-action"}>
                 Confirm {moderation.action}
               </button>
             </div>
@@ -1321,6 +1389,9 @@ function IncidentReviewFlow({
   const gdeltError = verification?.errors?.some((error) =>
     error.startsWith("GDELT"),
   );
+  const reasoningProvider = verification?.providers?.find((provider) =>
+    provider.startsWith("OpenRouter/") || provider.startsWith("Claude/"),
+  );
   const stages = [
     {
       label: "Evidence received",
@@ -1362,6 +1433,11 @@ function IncidentReviewFlow({
     },
   ];
   const correspondence = [
+    {
+      label: "Reasoning brain",
+      icon: BrainCircuit,
+      value: reasoningProvider || (verification ? "Deterministic safety fallback" : "Waiting to run"),
+    },
     {
       label: "Published fact-checks",
       icon: ShieldCheck,
@@ -2033,6 +2109,8 @@ function InlineIncidentDetail({
   onSourceCheck,
   onBypass,
   onPublish,
+  onDeleteReport,
+  isAdmin,
 }: {
   incident?: Incident;
   report?: Report;
@@ -2045,6 +2123,8 @@ function InlineIncidentDetail({
   onSourceCheck: () => void;
   onBypass: () => void;
   onPublish: () => void;
+  onDeleteReport: (report: Report) => void;
+  isAdmin: boolean;
 }) {
   if (!incident) {
     return (
@@ -2224,6 +2304,11 @@ function InlineIncidentDetail({
             ))}
           </div>
           <div className="response-actions">
+            {isAdmin && report && (
+              <button className="danger-action" disabled={busy} onClick={() => onDeleteReport(report)}>
+                <Trash2 /> Delete report
+              </button>
+            )}
             <button className="bypass-button" disabled={busy} onClick={onBypass}>Emergency bypass</button>
             <button className="primary" disabled={busy || incident.trust_state !== "Verified"} onClick={onPublish}>
               <Radio /> Publish alert
@@ -2255,13 +2340,14 @@ function UtilityWorkspace({
   onSelectCommunity,
   onCreateCommunity,
   onPostMessage,
-  onSendSms,
+  onSendNotification,
   onPublish,
   onDecision,
   onSourceCheck,
   onBypass,
   onCorrection,
   onModerate,
+  isAdmin,
 }: {
   view: Exclude<View, "Overview">;
   data: Queue;
@@ -2282,17 +2368,19 @@ function UtilityWorkspace({
   onSelectCommunity: (id: string) => void;
   onCreateCommunity: () => void;
   onPostMessage: (e: FormEvent<HTMLFormElement>) => void;
-  onSendSms: (e: FormEvent<HTMLFormElement>) => void;
+  onSendNotification: (e: FormEvent<HTMLFormElement>) => void;
   onPublish: () => void;
   onDecision: (action: string) => void;
   onSourceCheck: () => void;
   onBypass: () => void;
   onCorrection: (a: Alert) => void;
   onModerate: (v: {
-    community: Community;
+    community?: Community;
     message?: CommunityMessage;
+    report?: Report;
     action: string;
   }) => void;
+  isAdmin: boolean;
 }) {
   const [reportStatus, setReportStatus] = useState("All");
   const [reportCategory, setReportCategory] = useState("All");
@@ -2410,6 +2498,8 @@ function UtilityWorkspace({
                   onSourceCheck={onSourceCheck}
                   onBypass={onBypass}
                   onPublish={onPublish}
+                  onDeleteReport={(report) => onModerate({ report, action: "delete" })}
+                  isAdmin={isAdmin}
                 />
               )}
               </div>
@@ -2556,6 +2646,11 @@ function UtilityWorkspace({
                           {action}
                         </button>
                       ))}
+                      {isAdmin && (
+                        <button className="danger-action" onClick={() => onModerate({ community: currentCommunity, action: "delete" })}>
+                          <Trash2 /> Delete room
+                        </button>
+                      )}
                     </div>
                     <div className="message-stream">
                       {currentCommunity.messages?.map((message) => (
@@ -2573,7 +2668,7 @@ function UtilityWorkspace({
                               state={
                                 message.official
                                   ? "Official"
-                                  : message.status || "Community"
+                                  : message.moderation_status || message.status || "Community"
                               }
                             />
                             <time>{age(message.created_at)}</time>
@@ -2594,6 +2689,16 @@ function UtilityWorkspace({
                                 {action}
                               </button>
                             ))}
+                            {isAdmin && (
+                              <button className="danger-action" onClick={() => onModerate({ community: currentCommunity, message, action: "delete" })}>
+                                <Trash2 /> Delete
+                              </button>
+                            )}
+                            {isAdmin && !message.official && message.sender_id && (
+                              <button className="danger-action" onClick={() => onModerate({ community: currentCommunity, message, action: "kick" })}>
+                                <UserMinus /> Kick member
+                              </button>
+                            )}
                           </footer>
                         </article>
                       ))}
@@ -2729,16 +2834,16 @@ function UtilityWorkspace({
           )}
           {view === "Delivery" && (
             <div className="delivery-workspace">
-              <form className="sms-console" onSubmit={onSendSms}>
+              <form className="sms-console" onSubmit={onSendNotification}>
                 <header>
                   <div>
-                    <MessageSquare />
+                    <BellRing />
                     <span>
-                      <h3>Send SMS update</h3>
-                      <p>Audited Textbelt message · approved recipients only</p>
+                      <h3>Send phone notification</h3>
+                      <p>Audited authority update · Android notification bar</p>
                     </span>
                   </div>
-                  <StateBadge state={data.sms?.configured ? "Ready" : "Store-and-forward"} />
+                  <StateBadge state={data.notifications?.connected_device_count ? "Device connected" : "Waiting for phone"} />
                 </header>
                 <label>
                   Message title
@@ -2754,20 +2859,20 @@ function UtilityWorkspace({
                   <textarea
                     name="message"
                     minLength={8}
-                    maxLength={280}
+                    maxLength={500}
                     required
                     placeholder="Write a concise instruction with area, action and official source."
                   />
                 </label>
                 <div className="sms-console-foot">
                   <span>
-                    {data.sms?.configured
-                      ? `${data.sms.test_recipient_count} approved recipient${data.sms.test_recipient_count === 1 ? "" : "s"} · Textbelt ${data.sms.smtp_configured ? "SMTP ready" : "needs SMTP"}`
-                      : "Add TEXTBELT_TEST_RECIPIENTS and SMTP settings · submissions remain safely queued until then"}
+                    {data.notifications?.connected_device_count
+                      ? `${data.notifications.connected_device_count} citizen device${data.notifications.connected_device_count === 1 ? "" : "s"} connected · notification permission is controlled on the phone`
+                      : "Open BEACON on the phone and allow notifications, then retry"}
                   </span>
                   <button disabled={busy}>
-                    <Send />
-                    {busy ? "Sending…" : data.sms?.configured ? "Send SMS" : "Queue SMS"}
+                    <BellRing />
+                    {busy ? "Sending…" : "Notify phone"}
                   </button>
                 </div>
               </form>
@@ -2796,7 +2901,7 @@ function UtilityWorkspace({
                     <WorkspaceEmpty
                       icon={Send}
                       title="No delivery attempts"
-                      body="Send a test SMS or publish an official alert to begin the ledger."
+                      body="Send a phone notification or publish an official alert to begin the ledger."
                     />
                   )}
                 </div>

@@ -166,30 +166,25 @@ export default function App() {
               </>
             ) : (
               <>
-                <StatusCircle
-                  title={activeStatus.title}
-                  subtitle={activeStatus.subtitle}
-                  progress={activeStatus.progress}
-                  loading={activeStatus.loading}
-                  animated
-                  glow="intense"
-                />
-                {/* Only draw the bordered transcript box once there are lines
-                    to show. Before that: nothing while the model loads, and a
-                    calm centered hint (no empty container) once we're listening,
-                    so the waiting space reads as intentional, not unfinished. */}
+                {/* During capture the transcript is the primary work surface.
+                    Keep status copy inside it instead of spending the top half
+                    of the panel on a decorative listening visual. */}
                 {translation.transcripts.length > 0 ? (
                   <TranscriptFeed
                     transcripts={translation.transcripts}
                     translatingLabel={t('translating')}
                     speakingOriginal={translation.speakingOriginal}
+                    expanded
                   />
                 ) : (
-                  translation.isModelReady && (
-                    <div className="flex flex-1 items-center justify-center px-6 text-center">
-                      <p className="text-body text-muted">{t('playToStart')}</p>
-                    </div>
-                  )
+                  <div className="flex min-h-52 flex-1 flex-col items-center justify-center rounded-xl border border-[var(--border-color)] bg-[var(--surface-elevated)] px-6 text-center">
+                    <p className="text-body font-semibold text-[var(--text-primary)]">
+                      {activeStatus.title}
+                    </p>
+                    <p className="mt-1 text-caption text-muted">
+                      {activeStatus.loading ? activeStatus.subtitle : t('playToStart')}
+                    </p>
+                  </div>
                 )}
               </>
             )}

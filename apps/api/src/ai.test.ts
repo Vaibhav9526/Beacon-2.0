@@ -22,4 +22,14 @@ describe("BEACON AI safety gateway", () => {
     expect(run.result.specialist_outputs.radar.provenance).toBe("postgis/time-distance");
     expect(run.meta.fallback_path).toContain("local:success");
   });
+
+  it("can persist a report immediately while cloud enrichment is deferred", async () => {
+    const provider = vi.spyOn(globalThis, "fetch");
+    const run = await analyzeReport({ text: "Smoke near the market", hazardType: "fire", severity: "moderate", duplicate: { nearbyCount: 0, textSimilarity: 0, mediaHashMatch: false } }, { cloud: false });
+    expect(provider).not.toHaveBeenCalled();
+    expect(run.meta.provider).toBe("local-deterministic/v2");
+    expect(run.meta.fallback_path).toContain("claude:deferred");
+    expect(run.result.analysis_available).toBe(true);
+    provider.mockRestore();
+  });
 });

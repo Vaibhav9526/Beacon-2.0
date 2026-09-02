@@ -94,6 +94,7 @@ import {
   writeQueue,
 } from "./src/storage";
 import { themeFor, type, Theme } from "./src/theme";
+import { prepareNotificationBar, showAuthorityNotification } from "./src/notifications";
 import {
   Citizen,
   Community,
@@ -265,6 +266,8 @@ function leafletHtml(
   return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><style>html,body,#map{height:100%;margin:0;background:#e9e3da}.leaflet-control-attribution{font:9px system-ui}.pin{width:18px;height:18px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);border:3px solid white;box-shadow:0 2px 6px #0005}.pin span{display:none}</style></head><body><div id="map"></div><script>window.addEventListener('error',()=>window.ReactNativeWebView?.postMessage('map-error'),true)</script><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>try{const map=L.map('map',{zoomControl:false,attributionControl:true}).setView([${center.latitude},${center.longitude}],13);const tiles=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);tiles.on('tileerror',()=>window.ReactNativeWebView?.postMessage('map-error'));const entries=${safeMarkers};entries.forEach((m,i)=>{if(m.radiusMeters){L.circle([m.latitude,m.longitude],{radius:m.radiusMeters,color:m.color,weight:2,opacity:.7,fillColor:m.color,fillOpacity:.16,interactive:false}).addTo(map)}const icon=L.divIcon({className:'',html:'<div class="pin" style="background:'+m.color+'"><span>.</span></div>',iconSize:[24,24],iconAnchor:[12,24]});const pin=L.marker([m.latitude,m.longitude],{icon,draggable:${draggable}}).addTo(map).bindTooltip(m.label,{direction:'top'});if(${draggable}){pin.on('dragend',()=>window.ReactNativeWebView.postMessage(JSON.stringify(pin.getLatLng())));map.on('click',e=>{pin.setLatLng(e.latlng);window.ReactNativeWebView.postMessage(JSON.stringify(e.latlng))})}});if(${fitToMarkers}&&entries.length){map.fitBounds(L.latLngBounds(entries.map(m=>[m.latitude,m.longitude])),{padding:[42,42],maxZoom:14})}}catch(e){window.ReactNativeWebView?.postMessage('map-error')}</script></body></html>`;
 }
 const evidenceDirectory = new Directory(Paths.document, "beacon-evidence");
+const MAX_EVIDENCE_FILES = 4;
+const MAX_EVIDENCE_BYTES = 25_000_000;
 async function persistEvidence(uri: string, preferredName: string) {
   if (!evidenceDirectory.exists)
     evidenceDirectory.create({ intermediates: true });
@@ -272,6 +275,14 @@ async function persistEvidence(uri: string, preferredName: string) {
   const source = new File(uri);
   const destination = new File(evidenceDirectory, safeName);
   await source.copy(destination);
+  if (!destination.exists || destination.size <= 0) {
+    if (destination.exists) destination.delete();
+    throw new Error("The selected evidence file is empty");
+  }
+  if (destination.size > MAX_EVIDENCE_BYTES) {
+    destination.delete();
+    throw new Error("Evidence must be smaller than 25 MB");
+  }
   return destination.uri;
 }
 function discardEvidence(attachments: MediaAttachment[]) {
@@ -375,6 +386,12 @@ function CitizenApp() {
     );
   }, []);
 
+  useEffect(() => {
+    void prepareNotificationBar().then((granted) => {
+      if (!granted) showNotice("Notifications are off · enable BEACON in Android settings");
+    }).catch(() => undefined);
+  }, [showNotice]);
+
   const loadContext = useCallback(
     async (coordinate = currentPosition.current) => {
       try {
@@ -441,7 +458,13 @@ function CitizenApp() {
               json("POST", item.payload),
             );
           delivered += 1;
-        } catch {
+        } catch (error) {
+          console.warn("BEACON outbox delivery failed", item.kind, error);
+          // Validation, moderation, and authorization failures are permanent.
+          // Retrying these every 15 seconds only creates noise and can delay a
+          // valid report behind an item that can never succeed.
+          if (error instanceof ApiError && error.status >= 400 && error.status < 500)
+            continue;
           remaining.push({ ...item, attempts: item.attempts + 1 });
         }
       }
@@ -610,6 +633,20 @@ function CitizenApp() {
             message.event.startsWith("incident.")
           )
             void loadContext();
+          if (message.event === "authority.notification") {
+            void showAuthorityNotification(message.payload).then((shown) => {
+              showNotice(shown ? "Authority update added to notification bar" : "Authority update received · notifications are disabled");
+            });
+          }
+          if (message.event === "alert.published" || message.event === "alert.corrected") {
+            const alert = message.payload?.replacement || message.payload;
+            void showAuthorityNotification({
+              id: alert?.id,
+              title: alert?.title || "BEACON official alert",
+              body: alert?.body,
+              incident_id: alert?.incident_id,
+            });
+          }
           if (message.event.startsWith("community.")) void loadCommunities();
           if (
             message.event === "dispatch.updated" &&
@@ -727,6 +764,10 @@ function CitizenApp() {
   };
 
   const addPhotoOrVideo = async (kind: "photo" | "video") => {
+    if (draft.attachments.length >= MAX_EVIDENCE_FILES) {
+      Alert.alert("Evidence limit reached", "A report can include up to 4 photo, video, or audio files.");
+      return;
+    }
     const permission = await ImagePicker.requestCameraPermissionsAsync();
     if (!permission.granted) {
       Alert.alert(
@@ -745,13 +786,19 @@ function CitizenApp() {
     const name =
       asset.fileName ||
       `${kind}-${Date.now()}.${kind === "photo" ? "jpg" : "mp4"}`;
-    const attachment: MediaAttachment = {
-      uri: await persistEvidence(asset.uri, name),
-      name,
-      mimeType:
-        asset.mimeType || (kind === "photo" ? "image/jpeg" : "video/mp4"),
-      kind,
-    };
+    let attachment: MediaAttachment;
+    try {
+      attachment = {
+        uri: await persistEvidence(asset.uri, name),
+        name,
+        mimeType:
+          asset.mimeType || (kind === "photo" ? "image/jpeg" : "video/mp4"),
+        kind,
+      };
+    } catch (error) {
+      Alert.alert("Evidence could not be attached", error instanceof Error ? error.message : "Choose a smaller file and retry.");
+      return;
+    }
     setDraft((value) => ({
       ...value,
       attachments: [...value.attachments, attachment],
@@ -763,8 +810,18 @@ function CitizenApp() {
       await recorder.stop();
       await setAudioModeAsync({ allowsRecording: false });
       if (recorder.uri) {
+        if (draft.attachments.length >= MAX_EVIDENCE_FILES) {
+          Alert.alert("Evidence limit reached", "A report can include up to 4 photo, video, or audio files.");
+          return;
+        }
         const name = `voice-${Date.now()}.m4a`;
-        const uri = await persistEvidence(recorder.uri, name);
+        let uri: string;
+        try {
+          uri = await persistEvidence(recorder.uri, name);
+        } catch (error) {
+          Alert.alert("Audio could not be attached", error instanceof Error ? error.message : "Record a shorter clip and retry.");
+          return;
+        }
         setDraft((value) => ({
           ...value,
           attachments: [
@@ -773,6 +830,10 @@ function CitizenApp() {
           ],
         }));
       }
+      return;
+    }
+    if (draft.attachments.length >= MAX_EVIDENCE_FILES) {
+      Alert.alert("Evidence limit reached", "A report can include up to 4 photo, video, or audio files.");
       return;
     }
     const permission = await requestRecordingPermissionsAsync();
@@ -828,6 +889,7 @@ function CitizenApp() {
       // reclassify an accepted report as offline or enqueue a duplicate.
       void loadContext();
     } catch (error) {
+      console.warn("BEACON report delivery failed", error);
       if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
         Alert.alert(
           "Report was not sent",

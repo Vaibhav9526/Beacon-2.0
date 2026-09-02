@@ -12,6 +12,8 @@ describe("external claim verification", () => {
     vi.stubEnv("VERIFICATION_TIMEOUT_MS", "1000");
     vi.stubEnv("VERIFICATION_MAX_SOURCES", "8");
     vi.stubEnv("GROQ_API_KEY", "");
+    vi.stubEnv("OPENROUTER_API_KEY", "");
+    vi.stubEnv("ANTHROPIC_AUTH_TOKEN", "");
   });
 
   afterEach(() => {

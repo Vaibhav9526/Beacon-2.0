@@ -54,8 +54,12 @@ export const communities = pgTable("communities", {
 });
 
 export const messages = pgTable("messages", {
-  id: text("id").primaryKey(), communityId: text("community_id").notNull().references(() => communities.id), senderName: text("sender_name").notNull(), senderRole: text("sender_role").notNull(), body: text("body").notNull(), sourceLanguage: text("source_language").notNull().default("en"), translations: jsonb("translations").notNull().default({}), official: boolean("official").notNull().default(false), moderationStatus: text("moderation_status").notNull().default("visible"), ...stamps,
+  id: text("id").primaryKey(), communityId: text("community_id").notNull().references(() => communities.id), senderId: text("sender_id"), senderName: text("sender_name").notNull(), senderRole: text("sender_role").notNull(), body: text("body").notNull(), sourceLanguage: text("source_language").notNull().default("en"), translations: jsonb("translations").notNull().default({}), official: boolean("official").notNull().default(false), moderationStatus: text("moderation_status").notNull().default("visible"), ...stamps,
 });
+
+export const communityBans = pgTable("community_bans", {
+  id: text("id").primaryKey(), communityId: text("community_id").notNull().references(() => communities.id, { onDelete: "cascade" }), citizenId: text("citizen_id").notNull().references(() => citizens.id, { onDelete: "cascade" }), reason: text("reason").notNull(), actorId: text("actor_id").notNull(), ...stamps,
+}, (table) => [uniqueIndex("community_ban_member").on(table.communityId, table.citizenId)]);
 
 export const alerts = pgTable("alerts", {
   id: text("id").primaryKey(), incidentId: text("incident_id").references(() => incidents.id), title: text("title").notNull(), body: text("body").notNull(), severity: text("severity").notNull(), status: text("status").notNull().default("active"), supersededBy: text("superseded_by"), publishedAt: timestamp("published_at", { withTimezone: true }).notNull().defaultNow(), expiresAt: timestamp("expires_at", { withTimezone: true }),

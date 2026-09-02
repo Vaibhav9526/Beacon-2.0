@@ -68,10 +68,10 @@ function parseModelJson(value: string) {
   return AnalysisOutput.parse(JSON.parse(cleaned));
 }
 
-async function claude(prompt: string) {
+async function claude(prompt: string, timeoutMs = config.ai.timeoutMs) {
   const response = await fetch(`${config.ai.anthropicBaseUrl}/v1/messages`, {
     method: "POST",
-    signal: AbortSignal.timeout(config.ai.timeoutMs),
+    signal: AbortSignal.timeout(Math.max(250, timeoutMs)),
     headers: {
       "x-api-key": config.ai.anthropicAuthToken!,
       "anthropic-version": "2023-06-01",
@@ -92,9 +92,9 @@ async function claude(prompt: string) {
   return parseModelJson(text);
 }
 
-async function gemini(prompt: string) {
+async function gemini(prompt: string, timeoutMs = config.ai.timeoutMs) {
   const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.ai.geminiModel)}:generateContent?key=${encodeURIComponent(config.ai.geminiKey!)}`, {
-    method: "POST", signal: AbortSignal.timeout(config.ai.timeoutMs), headers: { "Content-Type": "application/json" },
+    method: "POST", signal: AbortSignal.timeout(Math.max(250, timeoutMs)), headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.1 } }),
   });
   if (!response.ok) throw new Error(`Gemini HTTP ${response.status}`);
@@ -104,9 +104,9 @@ async function gemini(prompt: string) {
   return parseModelJson(text);
 }
 
-async function groq(prompt: string) {
+async function groq(prompt: string, timeoutMs = config.ai.timeoutMs) {
   const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST", signal: AbortSignal.timeout(config.ai.timeoutMs), headers: { Authorization: `Bearer ${config.ai.groqKey}`, "Content-Type": "application/json" },
+    method: "POST", signal: AbortSignal.timeout(Math.max(250, timeoutMs)), headers: { Authorization: `Bearer ${config.ai.groqKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({ model: config.ai.groqModel, temperature: 0.1, response_format: { type: "json_object" }, messages: [{ role: "system", content: "Return only valid JSON matching the requested disaster evidence schema." }, { role: "user", content: prompt }] }),
   });
   if (!response.ok) throw new Error(`Groq HTTP ${response.status}`);
@@ -199,10 +199,10 @@ async function geminiJson(prompt: string, image?: { mime: string; data: string }
   return cleanJson(text);
 }
 
-async function groqVisionJson(prompt: string, image: { mime: string; data: string }) {
+async function groqVisionJson(prompt: string, image: { mime: string; data: string }, timeoutMs = config.ai.timeoutMs) {
   const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
-    signal: AbortSignal.timeout(Math.max(config.ai.timeoutMs, 25_000)),
+    signal: AbortSignal.timeout(Math.max(250, timeoutMs)),
     headers: { Authorization: `Bearer ${config.ai.groqKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: config.ai.groqVisionModel,
@@ -276,11 +276,13 @@ export async function translateForExtension(text: string, source: string, target
 export async function analyzeExtensionScreenshot(image: { mime: string; data: string }, pageTitle: string) {
   const prompt = `Read this screenshot from ${pageTitle || "an online page"}. Extract the main checkable factual claim and explain what the screenshot itself does and does not establish. Never decide that the claim is true merely from the screenshot. Return JSON {"claim":"...","reasoning":"two concise sentences","search_query":"short English query for published fact checks"}.`;
   const errors: string[] = [];
-  // Gemini is the primary screenshot/vision provider. Image analysis commonly
-  // needs longer than the short text-provider timeout, especially on cold start.
-  if (config.ai.geminiKey) try { return { result: ExtensionImageAnalysis.parse(await geminiJson(prompt, image, Math.max(config.ai.timeoutMs, 25_000))), provider: `gemini/${config.ai.geminiModel}`, errors }; } catch (error) { errors.push(safeProviderError("gemini", error)); }
-  if (config.ai.groqKey) try { return { result: ExtensionImageAnalysis.parse(await groqVisionJson(prompt, image)), provider: `groq/${config.ai.groqVisionModel}`, errors }; } catch (error) { errors.push(safeProviderError("groq-vision", error)); }
-  if (config.ai.anthropicAuthToken) try { return { result: ExtensionImageAnalysis.parse(await claudeJson(prompt, image)), provider: `claude/${config.ai.anthropicModel}`, errors }; } catch (error) { errors.push(safeProviderError("claude", error)); }
+  const deadline = Date.now() + 15_000;
+  const remaining = () => Math.max(0, deadline - Date.now());
+  // Groq Vision is currently the fastest healthy image provider for this
+  // deployment. Rate-limited Gemini and Claude remain bounded fallbacks.
+  if (config.ai.groqKey && remaining() >= 250) try { return { result: ExtensionImageAnalysis.parse(await groqVisionJson(prompt, image, remaining())), provider: `groq/${config.ai.groqVisionModel}`, errors }; } catch (error) { errors.push(safeProviderError("groq-vision", error)); }
+  if (config.ai.geminiKey && remaining() >= 250) try { return { result: ExtensionImageAnalysis.parse(await geminiJson(prompt, image, remaining())), provider: `gemini/${config.ai.geminiModel}`, errors }; } catch (error) { errors.push(safeProviderError("gemini", error)); }
+  if (config.ai.anthropicAuthToken && remaining() >= 250) try { return { result: ExtensionImageAnalysis.parse(await claudeJson(prompt, image)), provider: `claude/${config.ai.anthropicModel}`, errors }; } catch (error) { errors.push(safeProviderError("claude", error)); }
 
   // A provider outage must never turn screenshot capture into an HTTP 500.
   // Preserve the page context as a searchable, explicitly unverified claim.
@@ -310,25 +312,28 @@ function specialistOutputs(provider: string, input: AnalysisInput, result: z.inf
   };
 }
 
-export async function analyzeReport(input: AnalysisInput): Promise<AnalysisRun> {
+export async function analyzeReport(input: AnalysisInput, options: { cloud?: boolean } = {}): Promise<AnalysisRun> {
   const started = performance.now();
+  const cloud = options.cloud ?? true;
+  const deadline = Date.now() + Math.max(1_000, config.ai.timeoutMs);
+  const remaining = () => Math.max(0, deadline - Date.now());
   const { text: redacted, redactions } = redactPII(input.text, input.citizenName ? [input.citizenName] : []);
   const prompt = promptFor(input, redacted);
   const errors: string[] = [], fallback: string[] = [];
   let provider = "unavailable";
   let result: z.infer<typeof AnalysisOutput> | null = null;
-  if (config.ai.anthropicAuthToken) {
-    try { result = await claude(prompt); provider = `claude/${config.ai.anthropicModel}`; fallback.push("claude:success"); }
+  if (cloud && config.ai.anthropicAuthToken && remaining() >= 250) {
+    try { result = await claude(prompt, remaining()); provider = `claude/${config.ai.anthropicModel}`; fallback.push("claude:success"); }
     catch (error) { errors.push(safeProviderError("claude", error)); fallback.push("claude:failed"); }
-  } else fallback.push("claude:not-configured");
-  if (!result && config.ai.geminiKey) {
-    try { result = await gemini(prompt); provider = `gemini/${config.ai.geminiModel}`; fallback.push("gemini:success"); }
+  } else fallback.push(cloud ? "claude:not-configured" : "claude:deferred");
+  if (cloud && !result && config.ai.geminiKey && remaining() >= 250) {
+    try { result = await gemini(prompt, remaining()); provider = `gemini/${config.ai.geminiModel}`; fallback.push("gemini:success"); }
     catch (error) { errors.push(safeProviderError("gemini", error)); fallback.push("gemini:failed"); }
-  } else if (!result) fallback.push("gemini:not-configured");
-  if (!result && config.ai.groqKey) {
-    try { result = await groq(prompt); provider = `groq/${config.ai.groqModel}`; fallback.push("groq:success"); }
+  } else if (!result) fallback.push(cloud ? "gemini:not-configured" : "gemini:deferred");
+  if (cloud && !result && config.ai.groqKey && remaining() >= 250) {
+    try { result = await groq(prompt, remaining()); provider = `groq/${config.ai.groqModel}`; fallback.push("groq:success"); }
     catch (error) { errors.push(safeProviderError("groq", error)); fallback.push("groq:failed"); }
-  } else if (!result) fallback.push("groq:not-configured");
+  } else if (!result) fallback.push(cloud ? "groq:not-configured" : "groq:deferred");
   if (!result && !config.ai.disableLocal) {
     result = local(input, redacted); provider = "local-deterministic/v2"; fallback.push("local:success");
   }

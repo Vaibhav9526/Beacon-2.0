@@ -20,6 +20,9 @@ export const config = {
   publicApiUrl: process.env.PUBLIC_API_URL || "http://localhost:8000",
   demoAuth: asBoolean(process.env.ALLOW_DEMO_AUTH, process.env.NODE_ENV !== "production"),
   ai: {
+    openRouterKey: process.env.OPENROUTER_API_KEY,
+    openRouterModel: process.env.OPENROUTER_MODEL || "openrouter/free",
+    openRouterBaseUrl: (process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1").replace(/\/$/, ""),
     anthropicBaseUrl: (process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com").replace(/\/$/, ""),
     anthropicAuthToken: process.env.ANTHROPIC_AUTH_TOKEN,
     anthropicModel: process.env.ANTHROPIC_MODEL || "claude-3-5-haiku-latest",
@@ -56,7 +59,7 @@ export const config = {
   },
   uploads: {
     maxFiles: asNumber(process.env.UPLOAD_MAX_FILES, 4),
-    maxFileBytes: asNumber(process.env.UPLOAD_MAX_FILE_BYTES, 10_000_000),
+    maxFileBytes: asNumber(process.env.UPLOAD_MAX_FILE_BYTES, 25_000_000),
   },
   textbelt: {
     url: (process.env.TEXTBELT_URL || "").replace(/\/$/, ""),
@@ -72,6 +75,8 @@ export function serviceReadiness() {
   ].filter(Boolean);
   return {
     ai: {
+      openrouter: Boolean(config.ai.openRouterKey),
+      openrouter_model: config.ai.openRouterKey ? config.ai.openRouterModel : null,
       claude: Boolean(config.ai.anthropicAuthToken),
       gemini: Boolean(config.ai.geminiKey),
       groq: Boolean(config.ai.groqKey),

@@ -47,6 +47,7 @@ const form = new FormData();
 Object.entries({ citizen_id: session.citizen.id, hazard_type: "flood", severity: "high", text: "Flood water rising near the road, one person injured", requested_help: "Safe route and assessment", latitude: "21.2514", longitude: "81.6296" }).forEach(([key, value]) => form.set(key, value));
 const validPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
 form.set("media", new Blob([validPng], { type: "image/png" }), "evidence.png");
+form.set("evidence_count", "1");
 const report = await json("/reports", { method: "POST", headers: citizenAuth, body: form });
 check(report.analysis.analysis_available && report.analysis.specialist_outputs?.verifier, "AI specialist result missing");
 check(report.analysis.verification?.human_review_required === true, "External verification advisory or human-review guardrail missing");
@@ -61,6 +62,7 @@ check(duplicate.incident.id === report.incident.id && duplicate.incident.trust_s
 const invalidMedia = new FormData();
 Object.entries({ citizen_id: session.citizen.id, hazard_type: "flood", severity: "low", text: "Unsupported attachment test", latitude: "21.2515", longitude: "81.6297" }).forEach(([key, value]) => invalidMedia.set(key, value));
 invalidMedia.set("media", new Blob(["unsafe"], { type: "text/plain" }), "unsafe.txt");
+invalidMedia.set("evidence_count", "1");
 check(await status("/reports", { method: "POST", headers: citizenAuth, body: invalidMedia }) === 415, "Unsupported upload was not rejected");
 const unauthForm = new FormData();
 Object.entries({ citizen_id: session.citizen.id, hazard_type: "flood", severity: "low", text: "Unauthenticated report attempt", latitude: "21.2515", longitude: "81.6297" }).forEach(([key, value]) => unauthForm.set(key, value));
