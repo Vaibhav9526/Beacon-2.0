@@ -68,4 +68,27 @@ describe("BHASHINI translation adapter", () => {
     expect(result.provider).toBe("original-retained/BHASHINI-failed");
     expect(result.error).toBe("HTTP 503");
   });
+
+  it("uses a language-aware fallback instead of labeling Hindi as Chhattisgarhi", async () => {
+    vi.stubEnv("GEMINI_API_KEY", "test-gemini-key");
+    vi.stubEnv("GROQ_API_KEY", "");
+    vi.stubEnv("ANTHROPIC_AUTH_TOKEN", "");
+    const provider = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(String(input)).toContain("generativelanguage.googleapis.com");
+      const body = JSON.parse(String(init?.body));
+      expect(body.contents[0].parts[0].text).toContain("Chhattisgarhi (hne)");
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ translated_text: "\u092a\u093e\u0938 \u0915\u0947 \u0938\u0941\u0930\u0915\u094d\u0937\u093f\u0924 \u091c\u0917\u0939 \u092e\u0902 \u091c\u093e\u0935" }) }] } }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", provider);
+    const { translateText } = await import("./translation.js");
+
+    const result = await translateText("Move to the nearest safe place", "en", "hne", { aiFallback: true });
+
+    expect(result).toMatchObject({ target_language: "hne", provider: "gemini/gemini-3.5-flash-lite", available: true });
+    expect(result.text).not.toBe("Move to the nearest safe place");
+    expect(provider).toHaveBeenCalledOnce();
+  });
 });

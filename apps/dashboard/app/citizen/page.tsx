@@ -153,6 +153,7 @@ export default function Citizen() {
     fd.set("citizen_id", citizen.id);
     fd.set("latitude", "21.2514");
     fd.set("longitude", "81.6296");
+    fd.set("evidence_count", String(fd.getAll("media").filter((value) => value instanceof File && value.size > 0).length));
     try {
       const result: any = await fetch(`${getApiBase()}/reports`, {
         method: "POST",

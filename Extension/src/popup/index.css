@@ -1,0 +1,132 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --surface-bg: #F1F3F1;
+  --surface-elevated: #FFFFFF;
+  --text-primary: #111820;
+  --text-muted: #53616B;
+  --border-color: #C8D0CF;
+  --surface-shadow: 0 1px 3px rgba(17, 24, 32, 0.08), 0 1px 2px rgba(17, 24, 32, 0.04);
+  --brand-glow: rgba(0, 127, 139, 0.26);
+  --brand-glow-intense: rgba(0, 160, 168, 0.42);
+}
+
+.dark {
+  --surface-bg: #111820;
+  --surface-elevated: #182229;
+  --text-primary: #F7FAF9;
+  --text-muted: #AEB8BC;
+  --border-color: #344249;
+  --surface-shadow: none;
+  --brand-glow: rgba(0, 127, 139, 0.32);
+  --brand-glow-intense: rgba(0, 160, 168, 0.5);
+}
+
+@layer base {
+  html {
+    font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--surface-bg);
+    color: var(--text-primary);
+  }
+
+  .popup-shell {
+    background-color: var(--surface-bg);
+  }
+
+  img,
+  svg {
+    display: block;
+    max-width: none;
+  }
+
+  /* Buttons don't get a pointer cursor by default — make every enabled
+     interactive control show one. */
+  button:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+@keyframes pulseGlow {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1px rgba(0, 127, 139, 0.22),
+      0 0 20px var(--brand-glow);
+  }
+  50% {
+    box-shadow:
+      0 0 0 2px rgba(0, 160, 168, 0.38),
+      0 0 36px var(--brand-glow-intense);
+  }
+}
+
+@keyframes dropdownInDown {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes dropdownInUp {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@layer utilities {
+  .glow-teal {
+    box-shadow:
+      0 0 0 1px rgba(0, 127, 139, 0.18),
+      0 0 24px var(--brand-glow);
+  }
+
+  .glow-teal-intense {
+    animation: pulseGlow 2s ease-in-out infinite;
+  }
+
+  .dropdown-list,
+  .transcript-feed {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0, 127, 139, 0.45) transparent;
+  }
+
+  .dropdown-list::-webkit-scrollbar,
+  .transcript-feed::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .dropdown-list::-webkit-scrollbar-thumb,
+  .transcript-feed::-webkit-scrollbar-thumb {
+    background: rgba(0, 127, 139, 0.35);
+    border-radius: 999px;
+  }
+
+  .dropdown-list::-webkit-scrollbar-track,
+  .transcript-feed::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .dropdown-panel-down {
+    animation: dropdownInDown 0.15s ease-out;
+  }
+
+  .dropdown-panel-up {
+    animation: dropdownInUp 0.15s ease-out;
+  }
+}

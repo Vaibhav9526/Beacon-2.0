@@ -84,7 +84,7 @@ def seed() -> None:
     try:
         connection.executescript(SCHEMA)
         officials = [
-            ("official_admin", "Aditi Verma", "admin@beacon.local", "BeaconDemo!26", "admin", "Raipur District Control", "Raipur", 1),
+            ("official_admin", "Vaibhav Sharma", "admin@beacon.local", "BeaconDemo!26", "admin", "Raipur District Control", "Raipur", 1),
             ("official_responder", "Ravi Sahu", "responder@beacon.local", "ResponderDemo!26", "responder", "NDRF Demo Unit", "Raipur", 1),
         ]
         connection.executemany("INSERT OR IGNORE INTO official_users VALUES (?,?,?,?,?,?,?,?)", officials)
@@ -268,9 +268,28 @@ async def analyze(text: str, hazard: str, severity: str) -> tuple[dict, dict]:
         parsed["cloud_payload_preview"] = clean[:160]
         return parsed
 
+    anthropic_token = os.getenv("ANTHROPIC_AUTH_TOKEN")
+    anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+    anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest")
     gemini_key = os.getenv("GEMINI_API_KEY")
     groq_key = os.getenv("GROQ_API_KEY")
     async with httpx.AsyncClient(timeout=8) as client:
+        if anthropic_token:
+            try:
+                response = await client.post(
+                    f"{anthropic_base_url}/v1/messages",
+                    headers={"x-api-key": anthropic_token, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": anthropic_model, "max_tokens": 1200, "temperature": 0.1, "system": "Return only valid JSON for disaster evidence and fact-check synthesis. Do not invent sources or claim live retrieval.", "messages": [{"role": "user", "content": prompt}]},
+                )
+                response.raise_for_status()
+                text_content = next(part["text"] for part in response.json().get("content", []) if part.get("type") == "text")
+                result = await validate(text_content)
+                return result, {"provider": f"claude/{anthropic_model}", "latency_ms": int((time.perf_counter()-started)*1000), "confidence": None, "errors": errors, "fallback_path": fallback + ["claude:success"]}
+            except Exception as exc:
+                errors.append(f"claude:{type(exc).__name__}")
+                fallback.append("claude:failed")
+        else:
+            fallback.append("claude:not-configured")
         if gemini_key:
             try:
                 response = await client.post(

@@ -12,8 +12,16 @@ const sessionResponse = await fetch(`${api}/citizens/session`, {
 if (!sessionResponse.ok) throw new Error(`Session failed: ${sessionResponse.status} ${await sessionResponse.text()}`);
 const session = await sessionResponse.json();
 
+const loginResponse = await fetch(`${api}/authority/login`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ email: "admin@beacon.local", password: "BeaconDemo!26" }),
+});
+if (!loginResponse.ok) throw new Error(`Login failed: ${loginResponse.status}`);
+const login = await loginResponse.json();
+
 const eventPromise = new Promise((resolve, reject) => {
-  const socket = new WebSocket(`${wsUrl}?token=${encodeURIComponent("official_admin")}`);
+  const socket = new WebSocket(`${wsUrl}?token=${encodeURIComponent(login.token)}`);
   const timeout = setTimeout(() => { socket.close(); reject(new Error("Timed out waiting for incident.created")); }, 25_000);
   socket.on("message", (raw) => {
     const message = JSON.parse(raw.toString());
@@ -42,13 +50,6 @@ if (!reportResponse.ok) throw new Error(`Report failed: ${reportResponse.status}
 const report = await reportResponse.json();
 const event = await eventPromise;
 
-const loginResponse = await fetch(`${api}/authority/login`, {
-  method: "POST",
-  headers: { "content-type": "application/json" },
-  body: JSON.stringify({ email: "admin@beacon.local", password: "BeaconDemo!26" }),
-});
-if (!loginResponse.ok) throw new Error(`Login failed: ${loginResponse.status}`);
-const login = await loginResponse.json();
 const queueResponse = await fetch(`${api}/authority/queue`, { headers: { authorization: `Bearer ${login.token}` } });
 if (!queueResponse.ok) throw new Error(`Queue failed: ${queueResponse.status}`);
 const queue = await queueResponse.json();

@@ -1,3 +1,14 @@
+/*
+ * UI DIRECTION CONTRACT — BEACON-NAV-PILL-2026
+ * THESIS: a calm, data-first civic dashboard; maps live only in the heatmap.
+ * OWN-WORLD: midnight/royal/periwinkle/pale-blue, compact Arial-compatible type,
+ * thin dividers, exact disaster SVG symbols, and a floating expandable nav pill.
+ * STORY: understand status → report/SOS → track alerts/community → inspect areas/news.
+ * FIRST VIEWPORT: identity + live state, weather, activity, and emergency actions.
+ * REFUSALS: no map-first home, no decorative gradients, no stacked card mosaic.
+ * FINISH: unreviewed and undocumented is unfinished; this build ends with the finish
+ * review, the verdict, DESIGN.md, and every shipping raster carrying its provenance.
+ */
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import {
   RecordingPresets,
@@ -8,6 +19,7 @@ import {
 } from "expo-audio";
 import * as ImagePicker from "expo-image-picker";
 import * as Location from "expo-location";
+import { useNetworkState } from "expo-network";
 import { Directory, File, Paths } from "expo-file-system";
 import { StatusBar } from "expo-status-bar";
 import React, {
@@ -21,6 +33,7 @@ import {
   AccessibilityInfo,
   Alert,
   Animated,
+  BackHandler,
   FlatList,
   Image,
   KeyboardAvoidingView,
@@ -28,12 +41,20 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  Share,
   StyleSheet,
   Text,
   TextInput,
   useColorScheme,
   View,
 } from "react-native";
+import Reanimated, {
+  interpolate,
+  useAnimatedStyle,
+  useSharedValue,
+  withSpring,
+  withTiming,
+} from "react-native-reanimated";
 import {
   SafeAreaProvider,
   SafeAreaView,
@@ -41,8 +62,13 @@ import {
 } from "react-native-safe-area-context";
 
 const beaconLogo = require("./assets/beacon-logo.png");
+import DangerZoneIcon from "./assets/disaster/danger-zone.svg";
+import EvacuationIcon from "./assets/disaster/evacuation.svg";
+import FloodHighIcon from "./assets/disaster/flood-high.svg";
+import LandslideIcon from "./assets/disaster/landslide.svg";
 import { WebView } from "react-native-webview";
 import {
+  ApiError,
   api,
   fetchCommunities,
   fetchContext,
@@ -50,6 +76,7 @@ import {
   getWebSocketUrl,
   json,
   resolveApiBase,
+  setSessionRenewal,
   setSessionToken,
   submitReport,
   submitSos,
@@ -59,12 +86,15 @@ import {
   getDeviceId,
   readCitizen,
   readContext,
+  readLastReport,
   readQueue,
   writeCitizen,
   writeContext,
+  writeLastReport,
   writeQueue,
 } from "./src/storage";
 import { themeFor, type, Theme } from "./src/theme";
+import { prepareNotificationBar, showAuthorityNotification } from "./src/notifications";
 import {
   Citizen,
   Community,
@@ -205,6 +235,19 @@ const shortTime = (value?: string) =>
         minute: "2-digit",
       })
     : "Now";
+async function within<T>(promise: Promise<T>, timeoutMs: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Operation timed out")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 const facilityIcon = (kind: string) =>
   kind === "hospital" ? "hospital-building" : "home-group";
 function leafletHtml(
@@ -214,13 +257,17 @@ function leafletHtml(
     longitude: number;
     color: string;
     label: string;
+    radiusMeters?: number;
   }>,
   draggable = false,
+  fitToMarkers = false,
 ) {
   const safeMarkers = JSON.stringify(markers).replace(/</g, "\\u003c");
-  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><style>html,body,#map{height:100%;margin:0;background:#e9e3da}.leaflet-control-attribution{font:9px system-ui}.pin{width:18px;height:18px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);border:3px solid white;box-shadow:0 2px 6px #0005}.pin span{display:none}</style></head><body><div id="map"></div><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>const map=L.map('map',{zoomControl:false,attributionControl:true}).setView([${center.latitude},${center.longitude}],13);L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);const entries=${safeMarkers};entries.forEach((m,i)=>{const icon=L.divIcon({className:'',html:'<div class="pin" style="background:'+m.color+'"><span>.</span></div>',iconSize:[24,24],iconAnchor:[12,24]});const pin=L.marker([m.latitude,m.longitude],{icon,draggable:${draggable}}).addTo(map).bindTooltip(m.label,{direction:'top'});if(${draggable}){pin.on('dragend',()=>window.ReactNativeWebView.postMessage(JSON.stringify(pin.getLatLng())));map.on('click',e=>{pin.setLatLng(e.latlng);window.ReactNativeWebView.postMessage(JSON.stringify(e.latlng))})}});</script></body></html>`;
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><style>html,body,#map{height:100%;margin:0;background:#e9e3da}.leaflet-control-attribution{font:9px system-ui}.pin{width:18px;height:18px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);border:3px solid white;box-shadow:0 2px 6px #0005}.pin span{display:none}</style></head><body><div id="map"></div><script>window.addEventListener('error',()=>window.ReactNativeWebView?.postMessage('map-error'),true)</script><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>try{const map=L.map('map',{zoomControl:false,attributionControl:true}).setView([${center.latitude},${center.longitude}],13);const tiles=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);tiles.on('tileerror',()=>window.ReactNativeWebView?.postMessage('map-error'));const entries=${safeMarkers};entries.forEach((m,i)=>{if(m.radiusMeters){L.circle([m.latitude,m.longitude],{radius:m.radiusMeters,color:m.color,weight:2,opacity:.7,fillColor:m.color,fillOpacity:.16,interactive:false}).addTo(map)}const icon=L.divIcon({className:'',html:'<div class="pin" style="background:'+m.color+'"><span>.</span></div>',iconSize:[24,24],iconAnchor:[12,24]});const pin=L.marker([m.latitude,m.longitude],{icon,draggable:${draggable}}).addTo(map).bindTooltip(m.label,{direction:'top'});if(${draggable}){pin.on('dragend',()=>window.ReactNativeWebView.postMessage(JSON.stringify(pin.getLatLng())));map.on('click',e=>{pin.setLatLng(e.latlng);window.ReactNativeWebView.postMessage(JSON.stringify(e.latlng))})}});if(${fitToMarkers}&&entries.length){map.fitBounds(L.latLngBounds(entries.map(m=>[m.latitude,m.longitude])),{padding:[42,42],maxZoom:14})}}catch(e){window.ReactNativeWebView?.postMessage('map-error')}</script></body></html>`;
 }
 const evidenceDirectory = new Directory(Paths.document, "beacon-evidence");
+const MAX_EVIDENCE_FILES = 4;
+const MAX_EVIDENCE_BYTES = 25_000_000;
 async function persistEvidence(uri: string, preferredName: string) {
   if (!evidenceDirectory.exists)
     evidenceDirectory.create({ intermediates: true });
@@ -228,6 +275,14 @@ async function persistEvidence(uri: string, preferredName: string) {
   const source = new File(uri);
   const destination = new File(evidenceDirectory, safeName);
   await source.copy(destination);
+  if (!destination.exists || destination.size <= 0) {
+    if (destination.exists) destination.delete();
+    throw new Error("The selected evidence file is empty");
+  }
+  if (destination.size > MAX_EVIDENCE_BYTES) {
+    destination.delete();
+    throw new Error("Evidence must be smaller than 25 MB");
+  }
   return destination.uri;
 }
 function discardEvidence(attachments: MediaAttachment[]) {
@@ -244,6 +299,11 @@ function discardEvidence(attachments: MediaAttachment[]) {
 type IconName = React.ComponentProps<typeof MaterialCommunityIcons>["name"];
 type Styles = ReturnType<typeof makeStyles>;
 type ActiveSos = SosRequest & { queued?: boolean; queueId?: string };
+type ReportReceipt = {
+  status: "sent" | "queued";
+  reportId?: string;
+  updatedAt: string;
+};
 
 export default function App() {
   return (
@@ -260,6 +320,7 @@ function CitizenApp() {
   const insets = useSafeAreaInsets();
   const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const recorderState = useAudioRecorderState(recorder, 250);
+  const networkState = useNetworkState();
 
   const [booting, setBooting] = useState(true);
   const [citizen, setCitizen] = useState<Citizen | null>(null);
@@ -275,6 +336,8 @@ function CitizenApp() {
   const [outboxCount, setOutboxCount] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [reportOpen, setReportOpen] = useState(false);
+  const [reportSending, setReportSending] = useState(false);
+  const [lastReport, setLastReport] = useState<ReportReceipt | null>(null);
   const [pinOpen, setPinOpen] = useState(false);
   const [activeSos, setActiveSos] = useState<ActiveSos | null>(null);
   const [cancelCountdown, setCancelCountdown] = useState(0);
@@ -290,6 +353,7 @@ function CitizenApp() {
     attachments: [],
   });
   const [communityText, setCommunityText] = useState("");
+  const [communitySending, setCommunitySending] = useState(false);
   const [selectedCommunity, setSelectedCommunity] = useState<string | null>(
     null,
   );
@@ -322,6 +386,12 @@ function CitizenApp() {
     );
   }, []);
 
+  useEffect(() => {
+    void prepareNotificationBar().then((granted) => {
+      if (!granted) showNotice("Notifications are off · enable BEACON in Android settings");
+    }).catch(() => undefined);
+  }, [showNotice]);
+
   const loadContext = useCallback(
     async (coordinate = currentPosition.current) => {
       try {
@@ -331,6 +401,7 @@ function CitizenApp() {
         );
         setContext(value);
         await writeContext(value);
+        if (socketRef.current?.readyState === WebSocket.OPEN) setConnection("live");
         return true;
       } catch {
         const cached = await readContext();
@@ -346,7 +417,9 @@ function CitizenApp() {
     try {
       const value = await fetchCommunities();
       setCommunities(value);
-      setSelectedCommunity((current) => current || value[0]?.id || null);
+      setSelectedCommunity((current) =>
+        current && value.some((item) => item.id === current) ? current : null,
+      );
     } catch {
       /* Offline is a supported state. */
     }
@@ -356,6 +429,9 @@ function CitizenApp() {
     if (retryingRef.current) return;
     retryingRef.current = true;
     try {
+      // Network changes can make the Metro-derived host reachable after an
+      // earlier candidate failed. Re-probe before replaying the durable outbox.
+      await resolveApiBase();
       const queued = await readQueue();
       if (!queued.length) {
         setOutboxCount(0);
@@ -363,10 +439,12 @@ function CitizenApp() {
       }
       const remaining: QueueItem[] = [];
       let delivered = 0;
+      let deliveredReportId: string | undefined;
       for (const item of queued) {
         try {
           if (item.kind === "report") {
-            await submitReport(item.payload);
+            const result = await submitReport(item.payload);
+            deliveredReportId = result.report_id;
             discardEvidence(item.payload.attachments);
           }
           if (item.kind === "sos") {
@@ -380,13 +458,28 @@ function CitizenApp() {
               json("POST", item.payload),
             );
           delivered += 1;
-        } catch {
+        } catch (error) {
+          console.warn("BEACON outbox delivery failed", item.kind, error);
+          // Validation, moderation, and authorization failures are permanent.
+          // Retrying these every 15 seconds only creates noise and can delay a
+          // valid report behind an item that can never succeed.
+          if (error instanceof ApiError && error.status >= 400 && error.status < 500)
+            continue;
           remaining.push({ ...item, attempts: item.attempts + 1 });
         }
       }
       await writeQueue(remaining);
       setOutboxCount(remaining.length);
       if (delivered) {
+        if (deliveredReportId) {
+          const receipt: ReportReceipt = {
+            status: "sent",
+            reportId: deliveredReportId,
+            updatedAt: new Date().toISOString(),
+          };
+          setLastReport(receipt);
+          await writeLastReport(receipt);
+        }
         showNotice(
           `${delivered} queued ${delivered === 1 ? "item" : "items"} delivered`,
         );
@@ -399,79 +492,123 @@ function CitizenApp() {
 
   useEffect(() => {
     (async () => {
-      const [savedCitizen, cached, queue] = await Promise.all([
-        readCitizen(),
-        readContext(),
-        readQueue(),
-      ]);
-      if (savedCitizen) {
-        setSessionToken(savedCitizen.session_token);
-        setCitizen(savedCitizen);
-        setLang(savedCitizen.language || "en");
-      }
-      if (cached) setContext(cached);
-      setOutboxCount(queue.length);
-      await resolveApiBase();
-      // Renew the device session on startup. Demo resets and server-side expiry can
-      // invalidate an otherwise well-formed cached token.
-      if (savedCitizen) {
-        try {
-          const refreshed = await api<{ citizen: Citizen; token: string }>(
-            "/citizens/session",
-            json("POST", {
-              name: savedCitizen.name,
-              phone: savedCitizen.phone,
-              language: savedCitizen.language,
-              device_id: savedCitizen.device_id || (await getDeviceId()),
-            }),
-          );
-          Object.assign(savedCitizen, refreshed.citizen, {
-            session_token: refreshed.token,
-          });
-          setSessionToken(refreshed.token);
-          setCitizen(savedCitizen);
-          await writeCitizen(savedCitizen);
-        } catch {
-          /* The legacy session will be refreshed when connectivity returns. */
-        }
-      }
       try {
-        const permission = await Location.requestForegroundPermissionsAsync();
-        setLocationGranted(permission.granted);
-        if (permission.granted) {
-          const location = await Location.getCurrentPositionAsync({
-            accuracy: Location.Accuracy.Balanced,
-          });
-          const next = {
-            latitude: location.coords.latitude,
-            longitude: location.coords.longitude,
-          };
-          setPosition(next);
-          setDraft((current) => ({ ...current, coordinate: next }));
-          await loadContext(next);
-        } else await loadContext();
-      } catch {
-        await loadContext();
-      }
-      await loadCommunities();
-      if (savedCitizen?.session_token) {
-        try {
-          const active = await api<{
-            sos: SosRequest | null;
-            assignment: { eta_minutes?: number } | null;
-          }>("/sos/active");
-          if (active.sos)
-            setActiveSos({
-              ...active.sos,
-              eta_minutes: active.assignment?.eta_minutes,
-            });
-        } catch {
-          /* Active SOS recovery is best-effort while offline. */
+        const [savedCitizen, cached, queue, savedReport] = await Promise.all([
+          readCitizen(),
+          readContext(),
+          readQueue(),
+          readLastReport(),
+        ]);
+        if (savedCitizen) {
+          setSessionToken(savedCitizen.session_token);
+          setCitizen(savedCitizen);
+          setLang(savedCitizen.language || "en");
         }
+        if (cached) setContext(cached);
+        if (savedReport) setLastReport(savedReport);
+        setOutboxCount(queue.length);
+        await resolveApiBase();
+        // Renew the device session on startup. Demo resets and server-side expiry can
+        // invalidate an otherwise well-formed cached token.
+        if (savedCitizen) {
+          try {
+            const refreshed = await api<{ citizen: Citizen; token: string }>(
+              "/citizens/session",
+              json("POST", {
+                name: savedCitizen.name,
+                phone: savedCitizen.phone,
+                language: savedCitizen.language,
+                device_id: savedCitizen.device_id || (await getDeviceId()),
+              }),
+            );
+            Object.assign(savedCitizen, refreshed.citizen, {
+              session_token: refreshed.token,
+            });
+            setSessionToken(refreshed.token);
+            setCitizen(savedCitizen);
+            await writeCitizen(savedCitizen);
+          } catch {
+            /* The legacy session will be refreshed when connectivity returns. */
+          }
+        }
+        try {
+          const permission = await Location.requestForegroundPermissionsAsync();
+          setLocationGranted(permission.granted);
+          if (permission.granted) {
+            const location = await within(
+              Location.getCurrentPositionAsync({
+                accuracy: Location.Accuracy.Balanced,
+              }),
+              4500,
+            );
+            const next = {
+              latitude: location.coords.latitude,
+              longitude: location.coords.longitude,
+            };
+            setPosition(next);
+            setDraft((current) => ({ ...current, coordinate: next }));
+            await loadContext(next);
+          } else await loadContext();
+        } catch {
+          await loadContext();
+        }
+        await loadCommunities();
+        if (savedCitizen?.session_token) {
+          try {
+            const active = await api<{
+              sos: SosRequest | null;
+              assignment: { eta_minutes?: number } | null;
+            }>("/sos/active");
+            if (active.sos)
+              setActiveSos({
+                ...active.sos,
+                eta_minutes: active.assignment?.eta_minutes,
+              });
+          } catch {
+            /* Active SOS recovery is best-effort while offline. */
+          }
+        }
+      } catch {
+        setConnection("offline");
+      } finally {
+        setBooting(false);
       }
-      setBooting(false);
     })();
   }, [loadCommunities, loadContext]);
+
+  useEffect(() => {
+    if (!citizen) {
+      setSessionRenewal();
+      return;
+    }
+    setSessionRenewal(async () => {
+      const refreshed = await api<{ citizen: Citizen; token: string }>(
+        "/citizens/session",
+        json("POST", {
+          name: citizen.name,
+          phone: citizen.phone,
+          language: citizen.language,
+          device_id: citizen.device_id || (await getDeviceId()),
+        }),
+      );
+      const next = {
+        ...citizen,
+        ...refreshed.citizen,
+        session_token: refreshed.token,
+      };
+      setSessionToken(refreshed.token);
+      setCitizen(next);
+      await writeCitizen(next);
+      return refreshed.token;
+    });
+    return () => setSessionRenewal();
+  }, [
+    citizen?.id,
+    citizen?.name,
+    citizen?.phone,
+    citizen?.language,
+    citizen?.device_id,
+  ]);
 
   useEffect(() => {
     if (!citizen) return;
@@ -496,28 +633,43 @@ function CitizenApp() {
             message.event.startsWith("incident.")
           )
             void loadContext();
+          if (message.event === "authority.notification") {
+            void showAuthorityNotification(message.payload).then((shown) => {
+              showNotice(shown ? "Authority update added to notification bar" : "Authority update received · notifications are disabled");
+            });
+          }
+          if (message.event === "alert.published" || message.event === "alert.corrected") {
+            const alert = message.payload?.replacement || message.payload;
+            void showAuthorityNotification({
+              id: alert?.id,
+              title: alert?.title || "BEACON official alert",
+              body: alert?.body,
+              incident_id: alert?.incident_id,
+            });
+          }
           if (message.event.startsWith("community.")) void loadCommunities();
           if (
             message.event === "dispatch.updated" &&
             message.payload?.sos_id === currentSos.current?.id
           ) {
             setActiveSos((value) =>
-              value
+              value && !["Resolved", "Closed", "Rejected"].includes(message.payload.status)
                 ? {
                     ...value,
                     status: message.payload.status,
                     eta_minutes: message.payload.eta_minutes,
                   }
-                : value,
+                : null,
             );
           }
           if (
             message.event === "sos.updated" &&
             message.payload?.id === currentSos.current?.id
           )
-            setActiveSos((value) =>
-              value ? { ...value, ...message.payload } : value,
-            );
+            setActiveSos((value) => {
+              const next = value ? { ...value, ...message.payload } : value;
+              return next && ["Resolved", "Closed", "Rejected"].includes(next.status) ? null : next;
+            });
         } catch {
           /* Ignore malformed events. */
         }
@@ -556,7 +708,7 @@ function CitizenApp() {
   }, [cancelCountdown]);
 
   useEffect(() => {
-    if (!activeSos || activeSos.queued) return;
+    if (!activeSos || activeSos.queued || ["Resolved", "Closed", "Rejected"].includes(activeSos.status)) return;
     let subscription: Location.LocationSubscription | null = null;
     Location.watchPositionAsync(
       {
@@ -580,7 +732,7 @@ function CitizenApp() {
       })
       .catch(() => undefined);
     return () => subscription?.remove();
-  }, [activeSos?.id, activeSos?.queued]);
+  }, [activeSos?.id, activeSos?.queued, activeSos?.status]);
 
   const register = async () => {
     if (name.trim().length < 2 || phone.replace(/\D/g, "").length < 8) return;
@@ -612,6 +764,10 @@ function CitizenApp() {
   };
 
   const addPhotoOrVideo = async (kind: "photo" | "video") => {
+    if (draft.attachments.length >= MAX_EVIDENCE_FILES) {
+      Alert.alert("Evidence limit reached", "A report can include up to 4 photo, video, or audio files.");
+      return;
+    }
     const permission = await ImagePicker.requestCameraPermissionsAsync();
     if (!permission.granted) {
       Alert.alert(
@@ -630,13 +786,19 @@ function CitizenApp() {
     const name =
       asset.fileName ||
       `${kind}-${Date.now()}.${kind === "photo" ? "jpg" : "mp4"}`;
-    const attachment: MediaAttachment = {
-      uri: await persistEvidence(asset.uri, name),
-      name,
-      mimeType:
-        asset.mimeType || (kind === "photo" ? "image/jpeg" : "video/mp4"),
-      kind,
-    };
+    let attachment: MediaAttachment;
+    try {
+      attachment = {
+        uri: await persistEvidence(asset.uri, name),
+        name,
+        mimeType:
+          asset.mimeType || (kind === "photo" ? "image/jpeg" : "video/mp4"),
+        kind,
+      };
+    } catch (error) {
+      Alert.alert("Evidence could not be attached", error instanceof Error ? error.message : "Choose a smaller file and retry.");
+      return;
+    }
     setDraft((value) => ({
       ...value,
       attachments: [...value.attachments, attachment],
@@ -648,8 +810,18 @@ function CitizenApp() {
       await recorder.stop();
       await setAudioModeAsync({ allowsRecording: false });
       if (recorder.uri) {
+        if (draft.attachments.length >= MAX_EVIDENCE_FILES) {
+          Alert.alert("Evidence limit reached", "A report can include up to 4 photo, video, or audio files.");
+          return;
+        }
         const name = `voice-${Date.now()}.m4a`;
-        const uri = await persistEvidence(recorder.uri, name);
+        let uri: string;
+        try {
+          uri = await persistEvidence(recorder.uri, name);
+        } catch (error) {
+          Alert.alert("Audio could not be attached", error instanceof Error ? error.message : "Record a shorter clip and retry.");
+          return;
+        }
         setDraft((value) => ({
           ...value,
           attachments: [
@@ -658,6 +830,10 @@ function CitizenApp() {
           ],
         }));
       }
+      return;
+    }
+    if (draft.attachments.length >= MAX_EVIDENCE_FILES) {
+      Alert.alert("Evidence limit reached", "A report can include up to 4 photo, video, or audio files.");
       return;
     }
     const permission = await requestRecordingPermissionsAsync();
@@ -684,21 +860,43 @@ function CitizenApp() {
       attachments: [],
     });
   const sendReport = async () => {
-    if (!citizen || draft.text.trim().length < 8) return;
+    if (!citizen || reportSending) return;
+    if (draft.text.trim().length < 3) {
+      Alert.alert("Add a short description", "Type at least 3 characters, for example: Fire, Flood, or Help needed.");
+      return;
+    }
     const payload = {
       ...draft,
       text: draft.text.trim(),
       requested_help: draft.requested_help.trim(),
       citizen_id: citizen.id,
     };
+    setReportSending(true);
     try {
-      await submitReport(payload);
+      const result = await submitReport(payload);
       discardEvidence(payload.attachments);
       setReportOpen(false);
       resetDraft();
-      showNotice("Report received as unverified evidence");
-      await loadContext();
-    } catch {
+      const receipt: ReportReceipt = {
+        status: "sent",
+        reportId: result.report_id,
+        updatedAt: new Date().toISOString(),
+      };
+      setLastReport(receipt);
+      await writeLastReport(receipt);
+      showNotice("Report delivered to the authority review queue");
+      // The report receipt is authoritative. A follow-up map refresh must never
+      // reclassify an accepted report as offline or enqueue a duplicate.
+      void loadContext();
+    } catch (error) {
+      console.warn("BEACON report delivery failed", error);
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+        Alert.alert(
+          "Report was not sent",
+          `${error.message}. Your draft is still open so you can correct it and retry.`,
+        );
+        return;
+      }
       const count = await enqueue({
         id: uid("report"),
         kind: "report",
@@ -709,7 +907,12 @@ function CitizenApp() {
       setOutboxCount(count);
       setReportOpen(false);
       resetDraft();
-      showNotice("No connection · report saved to the outbox");
+      const receipt: ReportReceipt = { status: "queued", updatedAt: new Date().toISOString() };
+      setLastReport(receipt);
+      await writeLastReport(receipt);
+      showNotice("Connection unavailable · report secured in the outbox");
+    } finally {
+      setReportSending(false);
     }
   };
 
@@ -794,12 +997,13 @@ function CitizenApp() {
   const sendCommunityMessage = async () => {
     const communityId = selectedCommunity;
     const body = communityText.trim();
-    if (!citizen || !communityId || !body) return;
+    if (!citizen || !communityId || !body || communitySending) return;
     const payload = {
       communityId,
       citizen_id: citizen.id,
       body,
     };
+    setCommunitySending(true);
     try {
       await api(`/communities/${communityId}/messages`, json("POST", payload));
       setCommunityText("");
@@ -815,6 +1019,8 @@ function CitizenApp() {
       setOutboxCount(count);
       setCommunityText("");
       showNotice("Message saved to the outbox");
+    } finally {
+      setCommunitySending(false);
     }
   };
 
@@ -830,12 +1036,51 @@ function CitizenApp() {
           onPress: async () => {
             setSessionToken();
             await writeCitizen(null);
+            await writeLastReport(null);
+            setLastReport(null);
             setCitizen(null);
             setTab("home");
           },
         },
       ],
     );
+
+  const shareSafetyPacket = async () => {
+    const officialAlerts = context.alerts
+      .slice(0, 3)
+      .map((item) => `• ${item.title}: ${item.body}`)
+      .join("\n");
+    const nearbyHelp = context.facilities
+      .slice(0, 4)
+      .map((item) => `• ${item.name} (${item.kind})`)
+      .join("\n");
+    const packet = [
+      "BEACON OFFLINE SAFETY PACK",
+      `Updated: ${new Date().toLocaleString("en-IN")}`,
+      "Area: Raipur, Chhattisgarh (approximate)",
+      "",
+      "OFFICIAL ALERTS",
+      officialAlerts || "No active official alerts in the last sync.",
+      "",
+      "NEARBY VERIFIED HELP",
+      nearbyHelp || "No facility data in the last sync.",
+      "",
+      "Share using Android Quick Share, Bluetooth, or Wi-Fi Direct. Exact citizen location and identity are not included.",
+    ].join("\n");
+    try {
+      const result = await Share.share({
+        title: "BEACON offline safety pack",
+        message: packet,
+      });
+      showNotice(
+        result.action === Share.sharedAction
+          ? "Safety pack handed to the selected nearby channel"
+          : "Nearby sharing closed",
+      );
+    } catch {
+      showNotice("Nearby sharing is unavailable on this device");
+    }
+  };
 
   if (booting) return <BootScreen theme={theme} styles={styles} />;
   if (!citizen)
@@ -858,13 +1103,37 @@ function CitizenApp() {
     const updated = { ...citizen, language: value };
     setCitizen(updated);
     await writeCitizen(updated);
+    try {
+      await api(`/citizens/${citizen.id}/language`, json("PATCH", { language: value }));
+      await loadCommunities();
+    } catch {
+      showNotice("Language saved on this device · server sync will retry when connected");
+    }
+  };
+  const closeReport = () => {
+    if (!recorderState.isRecording) {
+      setReportOpen(false);
+      return;
+    }
+    Alert.alert(
+      "Voice recording in progress",
+      "Stop the recording before closing this report.",
+      [
+        { text: "Keep recording", style: "cancel" },
+        {
+          text: "Stop and close",
+          style: "destructive",
+          onPress: () => void toggleAudio().then(() => setReportOpen(false)),
+        },
+      ],
+    );
   };
   const navBottom = Math.max(insets.bottom, 8);
   return (
     <View style={styles.app}>
       <StatusBar style={scheme === "dark" ? "light" : "dark"} />
       {tab === "home" ? (
-        <HomeScreen
+        <DashboardScreen
           theme={theme}
           styles={styles}
           citizen={citizen}
@@ -876,6 +1145,7 @@ function CitizenApp() {
           context={context}
           connection={connection}
           outboxCount={outboxCount}
+          lastReport={lastReport}
           holding={holding}
           holdProgress={holdProgress}
           activeSos={activeSos}
@@ -903,6 +1173,25 @@ function CitizenApp() {
           text={communityText}
           setText={setCommunityText}
           onSend={sendCommunityMessage}
+          sending={communitySending}
+          language={lang}
+          citizen={citizen}
+        />
+      ) : tab === "heatmap" ? (
+        <HeatmapScreen
+          theme={theme}
+          styles={styles}
+          context={context}
+          position={position}
+          locationGranted={locationGranted}
+          connection={connection}
+        />
+      ) : tab === "news" ? (
+        <NewsScreen
+          theme={theme}
+          styles={styles}
+          context={context}
+          connection={connection}
         />
       ) : (
         <ProfileScreen
@@ -913,7 +1202,9 @@ function CitizenApp() {
           setLanguage={changeLanguage}
           connection={connection}
           outboxCount={outboxCount}
+          networkState={networkState}
           onRetry={deliverQueue}
+          onShareSafetyPacket={shareSafetyPacket}
           onSignOut={signOut}
         />
       )}
@@ -923,7 +1214,12 @@ function CitizenApp() {
         tab={tab}
         setTab={setTab}
         onReport={() => setReportOpen(true)}
+        onSos={() => {
+          setTab("home");
+          showNotice("Hold the SOS control on Home to request emergency help");
+        }}
         bottom={navBottom}
+        reduceMotion={reduceMotion}
       />
       {activeSos && tab !== "home" && (
         <CompactSos
@@ -948,7 +1244,8 @@ function CitizenApp() {
         draft={draft}
         setDraft={setDraft}
         recorderState={recorderState}
-        onClose={() => setReportOpen(false)}
+        submitting={reportSending}
+        onClose={closeReport}
         onPhoto={() => addPhotoOrVideo("photo")}
         onVideo={() => addPhotoOrVideo("video")}
         onAudio={toggleAudio}
@@ -1107,6 +1404,7 @@ function HomeScreen({
   context,
   connection,
   outboxCount,
+  lastReport,
   holding,
   holdProgress,
   activeSos,
@@ -1268,6 +1566,35 @@ function HomeScreen({
               {outboxCount} item{outboxCount > 1 ? "s" : ""} safely queued ·
               retrying automatically
             </Text>
+          </View>
+        )}
+        {lastReport && (
+          <View
+            accessibilityRole="summary"
+            style={[
+              styles.reportReceipt,
+              lastReport.status === "queued" && styles.reportReceiptQueued,
+            ]}
+          >
+            <View style={styles.reportReceiptIcon}>
+              <MaterialCommunityIcons
+                name={lastReport.status === "sent" ? "check-bold" : "cloud-clock-outline"}
+                size={18}
+                color={lastReport.status === "sent" ? theme.secondary : theme.amber}
+              />
+            </View>
+            <View style={styles.flex}>
+              <Text style={styles.reportReceiptTitle}>
+                {lastReport.status === "sent"
+                  ? "Report reached command centre"
+                  : "Report secured in your outbox"}
+              </Text>
+              <Text style={styles.reportReceiptBody}>
+                {lastReport.status === "sent"
+                  ? `Receipt ${lastReport.reportId?.slice(-8) || "issued"} · authority review pending`
+                  : "It will send automatically when the local network returns"}
+              </Text>
+            </View>
           </View>
         )}
         {context.alerts.slice(0, 2).map((alert: any) => (
@@ -1453,6 +1780,127 @@ function HomeScreen({
   );
 }
 
+function DashboardScreen({
+  theme,
+  styles,
+  citizen,
+  t,
+  lang,
+  setLang,
+  locationGranted,
+  context,
+  connection,
+  outboxCount,
+  lastReport,
+  holding,
+  holdProgress,
+  activeSos,
+  countdown,
+  onOpenReport,
+  onHoldStart,
+  onHoldEnd,
+  onCancelSos,
+  onOpenAlerts,
+}: any) {
+  const officialAreas = context.verified || [];
+  const safetyLabel = context.alerts.length
+    ? `${context.alerts.length} active official alert${context.alerts.length === 1 ? "" : "s"}`
+    : t.safe;
+  return (
+    <SafeAreaView style={styles.dbScreen} edges={["top"]}>
+      <View style={styles.dbHeader}>
+        <View style={styles.dbBrand}>
+          <Image source={beaconLogo} style={styles.dbLogo} accessible={false} />
+          <View><Text style={styles.dbBrandName}>BEACON</Text><Text style={styles.dbBrandMeta}>Citizen safety network</Text></View>
+        </View>
+        <View style={styles.dbHeaderActions}>
+          <ConnectionPill state={connection} theme={theme} styles={styles} />
+          <Pressable accessibilityRole="button" accessibilityLabel={`Language: ${languageNames[lang as Language]}`} accessibilityHint="Switch to the next safety language" onPress={() => setLang(nextLanguage(lang as Language))} style={styles.dbLanguage}>
+            <Text style={styles.dbLanguageText}>{String(lang).toUpperCase()}</Text>
+          </Pressable>
+        </View>
+      </View>
+      <ScrollView contentContainerStyle={styles.dbContent} showsVerticalScrollIndicator={false}>
+        <View style={styles.dbGreeting}>
+          <View style={styles.flex}>
+            <Text style={styles.dbEyebrow}>{t.hello}, {citizen.name.split(" ")[0]}</Text>
+            <Text style={styles.dbHeadline}>{safetyLabel}</Text>
+            <Text style={styles.dbSubhead}>{locationGranted ? "Raipur · private GPS enabled" : "Raipur area · location permission off"}</Text>
+          </View>
+          <View style={styles.dbShield}><MaterialCommunityIcons name="shield-check" size={24} color={theme.action} /></View>
+        </View>
+
+        <View style={styles.dbWeather}>
+          <View style={styles.dbWeatherIcon}><MaterialCommunityIcons name="weather-partly-cloudy" size={23} color="#FFFFFF" /></View>
+          <View style={styles.flex}><Text style={styles.dbWeatherLabel}>{context.weather.risk} weather risk</Text><Text style={styles.dbWeatherValue}>{context.weather.temperature}°</Text></View>
+          <View style={styles.dbWeatherFacts}><Text style={styles.dbWeatherFact}>{context.weather.precipitation || 0} mm rain</Text><Text style={styles.dbWeatherSource}>{context.weather.source || "cached"}</Text></View>
+        </View>
+
+        <View style={styles.dbSectionHead}><Text style={styles.dbSectionTitle}>Your dashboard</Text><Text style={styles.dbSectionMeta}>Live device data</Text></View>
+        <View style={styles.dbMetrics}>
+          <DashboardMetric icon="file-document-check-outline" label="Latest report" value={lastReport ? (lastReport.status === "sent" ? "Delivered" : "Queued") : "None yet"} tone={lastReport?.status === "queued" ? "amber" : "blue"} theme={theme} styles={styles} />
+          <DashboardMetric icon="alarm-light-outline" label="SOS" value={activeSos ? activeSos.status : "Inactive"} tone={activeSos ? "red" : "blue"} theme={theme} styles={styles} />
+          <DashboardMetric icon="bell-outline" label="Official alerts" value={String(context.alerts.length)} tone={context.alerts.length ? "amber" : "blue"} theme={theme} styles={styles} />
+          <DashboardMetric icon="map-marker-radius-outline" label="Affected areas" value={String(officialAreas.length)} tone="blue" theme={theme} styles={styles} />
+        </View>
+
+        {outboxCount > 0 && <View style={styles.outboxStrip}><MaterialCommunityIcons name="cloud-upload-outline" size={18} color={theme.amber} /><Text style={styles.outboxText}>{outboxCount} item{outboxCount > 1 ? "s" : ""} queued · retrying automatically</Text></View>}
+
+        <View style={styles.dbSectionHead}><Text style={styles.dbSectionTitle}>Take action</Text>{context.alerts.length > 0 && <Pressable onPress={onOpenAlerts} hitSlop={8}><Text style={styles.dbSectionLink}>View alerts</Text></Pressable>}</View>
+        <View style={styles.dbActions}>
+          <Pressable accessibilityRole="button" accessibilityLabel="Report an incident" onPress={onOpenReport} style={({ pressed }) => [styles.dbAction, pressed && styles.pressed]}>
+            <DangerZoneIcon width={34} height={34} /><View style={styles.flex}><Text style={styles.dbActionTitle}>{t.report}</Text><Text style={styles.dbActionMeta}>Text, voice, photo or video</Text></View><MaterialCommunityIcons name="arrow-top-right" size={18} color={theme.action} />
+          </Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel={activeSos ? "SOS help request active" : "Hold for SOS"} accessibilityHint="Press and hold for one point four seconds" onPressIn={onHoldStart} onPressOut={onHoldEnd} style={({ pressed }) => [styles.dbAction, styles.dbSosAction, pressed && styles.pressed]}>
+            <View style={styles.dbSosIcon}><MaterialCommunityIcons name="alarm-light" size={22} color="#FFFFFF" /></View>
+            <View style={styles.flex}><Text style={styles.dbActionTitle}>{activeSos ? "Help request active" : holding ? "Keep holding…" : t.sos}</Text><Text style={styles.dbActionMeta}>{activeSos ? activeSos.status : "Shares live location with command"}</Text>{holding && <View style={styles.holdTrack}><Animated.View style={[styles.holdFill, { width: holdProgress.interpolate({ inputRange: [0, 1], outputRange: ["0%", "100%"] }) }]} /></View>}</View>
+          </Pressable>
+        </View>
+        {activeSos && <ActiveSosCard sos={activeSos} countdown={countdown} onCancel={onCancelSos} theme={theme} styles={styles} />}
+
+        <View style={styles.dbProcess}>
+          <View style={styles.dbSectionHead}><View><Text style={styles.dbSectionTitle}>Report journey</Text><Text style={styles.dbSectionCaption}>Authority makes the final decision</Text></View><MaterialCommunityIcons name="shield-search" size={21} color={theme.action} /></View>
+          <View style={styles.trustJourneySteps} accessibilityLabel="Report verification process">
+            {[["file-check-outline", "Received"], ["translate", "Language"], ["brain", "AI screen"], ["account-check-outline", "Official"]].map(([icon, label], index) => <View key={label} style={styles.trustJourneyStep}><View style={styles.trustJourneyIcon}><MaterialCommunityIcons name={icon as any} size={16} color={theme.action} /></View><Text style={styles.trustJourneyStepLabel}>{label}</Text>{index < 3 && <View style={styles.trustJourneyConnector} />}</View>)}
+          </View>
+        </View>
+
+        <View style={styles.dbSectionHead}><View><Text style={styles.dbSectionTitle}>{t.near}</Text><Text style={styles.dbSectionCaption}>Verified facilities · updated today</Text></View></View>
+        <FlatList horizontal data={context.facilities} keyExtractor={(item) => item.id} contentContainerStyle={styles.facilityRow} showsHorizontalScrollIndicator={false} renderItem={({ item }) => <View style={styles.facilityCard}><View style={styles.facilityIcon}><MaterialCommunityIcons name={facilityIcon(item.kind)} size={22} color={theme.action} /></View><View style={styles.flex}><Text style={styles.facilityName}>{item.name}</Text><Text style={styles.verifiedText}>✓ Verified{item.capacity ? ` · ${item.capacity} spaces` : ""}</Text></View></View>} />
+        <View style={styles.dbFooterNote}><MaterialCommunityIcons name="lock-outline" size={16} color={theme.onSurfaceVariant} /><Text style={styles.layerNoteText}>Precise location stays private. Heatmap areas are authority-published and approximate.</Text></View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+function DashboardMetric({ icon, label, value, tone, theme, styles }: any) {
+  const color = tone === "red" ? theme.error : tone === "amber" ? theme.amber : theme.action;
+  return <View style={styles.dbMetric}><View style={[styles.dbMetricIcon, { backgroundColor: `${color}18` }]}><MaterialCommunityIcons name={icon} size={18} color={color} /></View><Text style={styles.dbMetricValue} numberOfLines={1}>{value}</Text><Text style={styles.dbMetricLabel}>{label}</Text></View>;
+}
+
+function HeatmapScreen({ theme, styles, context, position, locationGranted, connection }: any) {
+  const [mapFailed, setMapFailed] = useState(false);
+  const officialAreas = context.verified || [];
+  const region = { ...position, latitudeDelta: 0.08, longitudeDelta: 0.08 };
+  const markers = officialAreas.map((item: any) => ({ ...item, color: theme.error, radiusMeters: 650, label: `Approximate official affected area: ${item.title}` }));
+  return (
+    <SafeAreaView style={styles.hmScreen} edges={["top"]}>
+      <View style={styles.hmHeader}><View><Text style={styles.hmEyebrow}>AUTHORITY MAP</Text><Text style={styles.hmTitle}>Affected areas</Text></View><ConnectionPill state={connection} theme={theme} styles={styles} /></View>
+      <View style={styles.hmMapWrap}>
+        <WebView accessibilityLabel="Authority affected-area heatmap" originWhitelist={["*"]} source={{ html: leafletHtml(region, markers, false, true) }} style={StyleSheet.absoluteFill} javaScriptEnabled domStorageEnabled mixedContentMode="never" onError={() => setMapFailed(true)} onHttpError={() => setMapFailed(true)} onMessage={(event) => event.nativeEvent.data === "map-error" && setMapFailed(true)} />
+        {mapFailed && <View style={styles.hmMapFallback}><MaterialCommunityIcons name="map-marker-off-outline" size={22} color={theme.onSurfaceVariant} /><Text style={styles.hmMapFallbackTitle}>Map tiles unavailable</Text><Text style={styles.hmMapFallbackBody}>The authority area list remains available below.</Text></View>}
+        <View style={styles.hmLegend}><View style={styles.hmLegendDot} /><Text style={styles.hmLegendText}>Authority verified</Text></View>
+        <View style={styles.hmLocation}><MaterialCommunityIcons name={locationGranted ? "crosshairs-gps" : "map-marker-outline"} size={16} color={theme.action} /><Text style={styles.hmLocationText}>{locationGranted ? "Your private position" : "Approximate Raipur area"} · halos are not boundaries</Text></View>
+      </View>
+      <View style={styles.hmSheet}><View style={styles.hmHandle} /><View style={styles.dbSectionHead}><View><Text style={styles.dbSectionTitle}>Area briefing</Text><Text style={styles.dbSectionCaption}>{officialAreas.length} authority-published area{officialAreas.length === 1 ? "" : "s"}</Text></View><EvacuationIcon width={32} height={32} /></View><ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.hmList}>{officialAreas.length ? officialAreas.map((item: any, index: number) => <View key={item.id} style={styles.hmItem}><View style={styles.hmIndex}><Text style={styles.hmIndexText}>{String(index + 1).padStart(2, "0")}</Text></View><View style={styles.flex}><Text style={styles.hmItemTitle}>{item.title}</Text><Text style={styles.hmItemMeta}>{item.approximate_area || "Approximate public area"} · {item.severity}</Text></View><MaterialCommunityIcons name="shield-check" size={18} color={theme.action} /></View>) : <EmptyState icon="map-marker-check-outline" title="No affected areas published" body="This map changes only when the authority verifies and publishes an affected area." theme={theme} styles={styles} />}</ScrollView></View>
+    </SafeAreaView>
+  );
+}
+
+function NewsScreen({ theme, styles, context, connection }: any) {
+  return <SafeAreaView style={styles.screen} edges={["top"]}><ScreenHeader eyebrow="OFFICIAL SHORTS" title="News" connection={connection} theme={theme} styles={styles} /><ScrollView contentContainerStyle={styles.newsContent}><Text style={styles.newsIntro}>Short, verified updates from the currently active authority feed.</Text>{context.alerts.length ? context.alerts.map((alert: any, index: number) => <View key={alert.id} style={styles.newsCard}><Text style={styles.newsNumber}>{String(index + 1).padStart(2, "0")}</Text><View style={styles.flex}><Text style={styles.officialLabel}>OFFICIAL UPDATE</Text><Text style={styles.newsTitle}>{alert.title}</Text><Text style={styles.newsBody}>{alert.body}</Text><Text style={styles.newsTime}>{shortTime(alert.published_at)}</Text></View></View>) : <EmptyState icon="newspaper-check" title="No official updates" body="Current verified authority alerts will appear as short briefings here." theme={theme} styles={styles} />}</ScrollView></SafeAreaView>;
+}
+
 function AlertsScreen({ theme, styles, context, connection }: any) {
   return (
     <SafeAreaView style={styles.screen} edges={["top"]}>
@@ -1514,38 +1962,51 @@ function CommunityScreen({
   text,
   setText,
   onSend,
+  sending,
+  language,
+  citizen,
 }: any) {
   const community = communities.find((item: Community) => item.id === selected);
+  const [showOriginal, setShowOriginal] = useState<Record<string, boolean>>({});
+  const [query, setQuery] = useState("");
+  const roomScroll = useRef<ScrollView>(null);
+  const filtered = communities.filter((item: Community) =>
+    item.name.toLowerCase().includes(query.trim().toLowerCase()),
+  );
+  if (!selected) {
+    return (
+      <SafeAreaView style={styles.chatScreen} edges={["top"]}>
+        <View style={styles.chatListHeader}>
+          <View><Text style={styles.chatEyebrow}>APPROVED NETWORKS</Text><Text style={styles.chatListTitle}>Community</Text></View>
+          <View style={styles.chatHeaderIcon}><MaterialCommunityIcons name="shield-account" size={21} color={theme.action} /></View>
+        </View>
+        <View style={styles.chatSearch}><MaterialCommunityIcons name="magnify" size={19} color={theme.onSurfaceVariant} /><TextInput value={query} onChangeText={setQuery} placeholder="Search community" placeholderTextColor={theme.onSurfaceVariant} style={styles.chatSearchInput} /></View>
+        <View style={styles.chatFilterRow}><View style={styles.chatFilterActive}><Text style={styles.chatFilterActiveText}>All</Text></View><View style={styles.chatFilter}><Text style={styles.chatFilterText}>Authority approved</Text></View></View>
+        {filtered.length ? <FlatList data={filtered} keyExtractor={(item) => item.id} contentContainerStyle={styles.chatList} renderItem={({ item }) => {
+          const last = item.messages?.[item.messages.length - 1];
+          return <Pressable onPress={() => setSelected(item.id)} style={({ pressed }) => [styles.chatRow, pressed && styles.pressed]}>
+            <View style={styles.chatAvatar}><Text style={styles.chatAvatarText}>{item.name.slice(0, 2).toUpperCase()}</Text></View>
+            <View style={styles.chatRowBody}><View style={styles.chatRowHead}><Text style={styles.chatRowName} numberOfLines={1}>{item.name}</Text><Text style={styles.chatRowTime}>{last ? shortTime(last.created_at) : ""}</Text></View><View style={styles.chatPreviewRow}><MaterialCommunityIcons name="check-decagram" size={14} color={theme.action} /><Text style={styles.chatPreview} numberOfLines={1}>{last?.body || `${item.member_count} members · awaiting first update`}</Text></View></View>
+          </Pressable>;
+        }} /> : <EmptyState icon="account-group-outline" title={communities.length ? "No matching community" : "No approved community nearby"} body={communities.length ? "Try another community name." : "Incident communities appear only after authority approval."} theme={theme} styles={styles} />}
+      </SafeAreaView>
+    );
+  }
   return (
-    <SafeAreaView style={styles.screen} edges={["top"]}>
-      <ScreenHeader
-        eyebrow="APPROVED LOCAL GROUPS"
-        title="Community"
-        theme={theme}
-        styles={styles}
-      />
+    <SafeAreaView style={styles.chatScreen} edges={["top"]}>
+      <View style={styles.chatRoomHeader}>
+        <Pressable accessibilityLabel="Back to communities" onPress={() => setSelected(null)} style={styles.chatBack}><MaterialCommunityIcons name="arrow-left" size={22} color={theme.onSurface} /></Pressable>
+        <View style={styles.chatRoomAvatar}><Text style={styles.chatRoomAvatarText}>{community?.name.slice(0, 2).toUpperCase()}</Text></View>
+        <View style={styles.flex}><Text style={styles.chatRoomTitle} numberOfLines={1}>{community?.name}</Text><Text style={styles.chatRoomMeta}>{community?.member_count || 0} members · authority approved</Text></View>
+        <MaterialCommunityIcons name="shield-check" size={20} color={theme.action} />
+      </View>
       <View style={styles.communityLayout}>
-        {communities.length ? (
-          <>
+        {community ? <>
             <ScrollView
-              horizontal
-              contentContainerStyle={styles.communityChips}
-              showsHorizontalScrollIndicator={false}
-            >
-              {communities.map((item: Community) => (
-                <ChoiceChip
-                  key={item.id}
-                  label={item.name}
-                  selected={selected === item.id}
-                  onPress={() => setSelected(item.id)}
-                  theme={theme}
-                  styles={styles}
-                />
-              ))}
-            </ScrollView>
-            <ScrollView
+              ref={roomScroll}
               style={styles.messages}
-              contentContainerStyle={styles.messageContent}
+              contentContainerStyle={styles.chatMessageContent}
+              onContentSizeChange={() => roomScroll.current?.scrollToEnd({ animated: false })}
             >
               {community?.messages?.length ? (
                 community.messages.map(
@@ -1553,12 +2014,13 @@ function CommunityScreen({
                     <View
                       key={message.id}
                       style={[
-                        styles.messageCard,
+                        styles.chatBubble,
+                        message.sender_name === citizen?.name && styles.chatBubbleMine,
                         message.official && styles.officialMessage,
                       ]}
                     >
                       <View style={styles.messageHead}>
-                        <Text style={styles.messageSender}>
+                        <Text style={styles.messageSender} numberOfLines={1}>
                           {message.sender_name}
                         </Text>
                         {message.official && (
@@ -1568,7 +2030,33 @@ function CommunityScreen({
                           {shortTime(message.created_at)}
                         </Text>
                       </View>
-                      <Text style={styles.messageBody}>{message.body}</Text>
+                      <Text style={styles.messageBody}>
+                        {showOriginal[message.id] ? message.original_body : message.body}
+                      </Text>
+                      {message.translated && (
+                        <View style={styles.translationRow}>
+                          <MaterialCommunityIcons name="translate" size={14} color={theme.secondary} />
+                          <Text style={styles.communityTranslationNote}>
+                            {showOriginal[message.id]
+                              ? `Original · ${languageNames[message.source_language] || message.source_language}`
+                              : `Translated to ${languageNames[message.display_language] || message.display_language}`}
+                          </Text>
+                          <Pressable
+                            accessibilityRole="button"
+                            accessibilityLabel={showOriginal[message.id] ? "Show translated message" : "Show original message"}
+                            onPress={() => setShowOriginal((current) => ({ ...current, [message.id]: !current[message.id] }))}
+                            hitSlop={10}
+                          >
+                            <Text style={styles.translationToggle}>{showOriginal[message.id] ? "Show translation" : "View original"}</Text>
+                          </Pressable>
+                        </View>
+                      )}
+                      {!message.translation_available && message.requested_language === language && (
+                        <View style={styles.translationRow}>
+                          <MaterialCommunityIcons name="translate-off" size={14} color={theme.amber} />
+                          <Text style={styles.translationUnavailable}>Translation unavailable · showing original</Text>
+                        </View>
+                      )}
                     </View>
                   ),
                 )
@@ -1583,26 +2071,30 @@ function CommunityScreen({
               )}
             </ScrollView>
             <View style={styles.composer}>
-              <TextInput
+              <View style={styles.chatComposerField}>
+                <MaterialCommunityIcons name="message-text-outline" size={18} color={theme.onSurfaceVariant} />
+                <TextInput
                 accessibilityLabel="Community message"
                 value={text}
                 onChangeText={setText}
                 multiline
-                style={styles.composerInput}
-                placeholder="Share a useful local update"
+                style={styles.chatComposerInput}
+                placeholder="Message community"
                 placeholderTextColor={theme.onSurfaceVariant}
               />
+              </View>
               <Pressable
                 accessibilityLabel="Send message"
-                disabled={!text.trim()}
+                accessibilityRole="button"
+                accessibilityState={{ disabled: !text.trim() || sending, busy: sending }}
+                disabled={!text.trim() || sending}
                 onPress={onSend}
-                style={[styles.sendIcon, !text.trim() && styles.disabled]}
+                style={[styles.sendIcon, (!text.trim() || sending) && styles.disabled]}
               >
-                <MaterialCommunityIcons name="send" size={20} color="#FFFFFF" />
+                <MaterialCommunityIcons name={sending ? "clock-outline" : "send"} size={20} color="#FFFFFF" />
               </Pressable>
             </View>
-          </>
-        ) : (
+          </> : (
           <View style={styles.screenContent}>
             <EmptyState
               icon="account-group-outline"
@@ -1626,7 +2118,9 @@ function ProfileScreen({
   setLanguage,
   connection,
   outboxCount,
+  networkState,
   onRetry,
+  onShareSafetyPacket,
   onSignOut,
 }: any) {
   return (
@@ -1706,12 +2200,48 @@ function ProfileScreen({
             styles={styles}
           />
           <SettingRow
+            icon="wifi"
+            label="Active device network"
+            value={String(networkState?.type || "unknown").toLowerCase()}
+            theme={theme}
+            styles={styles}
+          />
+          <SettingRow
             icon="crosshairs-gps"
             label="Location sharing"
             value="SOS and reports only"
             theme={theme}
             styles={styles}
           />
+        </View>
+        <Text style={styles.groupLabel}>Nearby emergency relay</Text>
+        <View style={styles.relayPanel}>
+          <View style={styles.relayTitleRow}>
+            <MaterialCommunityIcons
+              name="access-point-network"
+              size={22}
+              color={theme.secondary}
+            />
+            <View style={styles.flex}>
+              <Text style={styles.relayTitle}>Share the last safety pack</Text>
+              <Text style={styles.relayBody}>
+                Opens Android Quick Share so you can relay cached official alerts
+                over Bluetooth or Wi-Fi Direct when mobile data is weak.
+              </Text>
+            </View>
+          </View>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Share offline safety pack to a nearby device"
+            onPress={onShareSafetyPacket}
+            style={styles.relayButton}
+          >
+            <MaterialCommunityIcons name="share-variant" size={19} color="#FFFFFF" />
+            <Text style={styles.relayButtonText}>Open nearby sharing</Text>
+          </Pressable>
+          <Text style={styles.relayPrivacy}>
+            Includes approximate area only · no name, phone or exact coordinates
+          </Text>
         </View>
         {outboxCount > 0 && (
           <Pressable onPress={onRetry} style={styles.outlinedButton}>
@@ -1756,8 +2286,9 @@ function ReportSheet({
   onAudio,
   onPin,
   onSubmit,
+  submitting,
 }: any) {
-  const ready = draft.text.trim().length >= 8;
+  const ready = draft.text.trim().length >= 3;
   return (
     <Modal
       visible={visible}
@@ -1793,16 +2324,19 @@ function ReportSheet({
             keyboardShouldPersistTaps="handled"
             contentContainerStyle={styles.reportContent}
           >
+            <View style={styles.reportStepHead}>
+              <Text style={styles.reportStepNumber}>01</Text>
+              <View style={styles.flex}>
+                <Text style={styles.reportStepTitle}>Describe the incident</Text>
+                <Text style={styles.reportStepBody}>Choose a hazard, then record only what you can observe.</Text>
+              </View>
+            </View>
             <Text style={styles.fieldLabel}>Hazard</Text>
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.chipRow}
-            >
+            <View style={styles.hazardGrid}>
               {hazards.map((value) => (
-                <ChoiceChip
+                <HazardChoice
                   key={value}
-                  label={value[0].toUpperCase() + value.slice(1)}
+                  value={value}
                   selected={draft.hazard_type === value}
                   onPress={() =>
                     setDraft((current: ReportDraft) => ({
@@ -1814,7 +2348,7 @@ function ReportSheet({
                   styles={styles}
                 />
               ))}
-            </ScrollView>
+            </View>
             <Text style={styles.fieldLabel}>What can you see?</Text>
             <TextInput
               accessibilityLabel="Describe the incident"
@@ -1828,7 +2362,16 @@ function ReportSheet({
               placeholder="Describe what happened and whether anyone is in immediate danger."
               placeholderTextColor={theme.onSurfaceVariant}
             />
-            <Text style={styles.characterCount}>{draft.text.length}/700</Text>
+            <Text style={styles.characterCount}>
+              {ready ? `${draft.text.length}/700 · Ready to send` : `${draft.text.length}/700 · Enter at least 3 characters`}
+            </Text>
+            <View style={styles.reportStepHead}>
+              <Text style={styles.reportStepNumber}>02</Text>
+              <View style={styles.flex}>
+                <Text style={styles.reportStepTitle}>Set urgency and need</Text>
+                <Text style={styles.reportStepBody}>Severity helps prioritize review; SOS remains the emergency channel.</Text>
+              </View>
+            </View>
             <Text style={styles.fieldLabel}>Severity</Text>
             <View style={styles.chipWrap}>
               {severities.map((value) => (
@@ -1868,6 +2411,13 @@ function ReportSheet({
               placeholder="e.g. evacuation or medical assistance"
               placeholderTextColor={theme.onSurfaceVariant}
             />
+            <View style={styles.reportStepHead}>
+              <Text style={styles.reportStepNumber}>03</Text>
+              <View style={styles.flex}>
+                <Text style={styles.reportStepTitle}>Add evidence and location</Text>
+                <Text style={styles.reportStepBody}>Attachments are optional. Confirm the pin before sending.</Text>
+              </View>
+            </View>
             <Text style={styles.fieldLabel}>Evidence and location</Text>
             <View style={styles.evidenceGrid}>
               <EvidenceButton
@@ -1942,6 +2492,8 @@ function ReportSheet({
                       </Text>
                       <Pressable
                         accessibilityLabel={`Remove ${item.kind}`}
+                        accessibilityRole="button"
+                        hitSlop={12}
                         onPress={() =>
                           setDraft((current: ReportDraft) => ({
                             ...current,
@@ -1974,16 +2526,19 @@ function ReportSheet({
               </Text>
             </View>
             <Pressable
-              disabled={!ready || recorderState.isRecording}
+              accessibilityState={{ disabled: !ready || recorderState.isRecording || submitting, busy: submitting }}
+              disabled={!ready || recorderState.isRecording || submitting}
               onPress={onSubmit}
               style={({ pressed }) => [
                 styles.filledButton,
-                (!ready || recorderState.isRecording) && styles.disabled,
+                (!ready || recorderState.isRecording || submitting) && styles.disabled,
                 pressed && ready && styles.pressed,
               ]}
             >
-              <MaterialCommunityIcons name="send" size={19} color="#FFFFFF" />
-              <Text style={styles.filledButtonText}>Send report securely</Text>
+              <MaterialCommunityIcons name="cloud-upload-outline" size={19} color="#FFFFFF" />
+              <Text style={styles.filledButtonText}>
+                {submitting ? "Sending to command centre…" : "Send report securely"}
+              </Text>
             </Pressable>
           </ScrollView>
         </View>
@@ -2086,51 +2641,55 @@ function PinEditor({
   );
 }
 
-function BottomNav({ theme, styles, tab, setTab, onReport, bottom }: any) {
+function BottomNav({ theme, styles, tab, setTab, onReport, onSos, bottom, reduceMotion }: any) {
+  const [open, setOpen] = useState(false);
+  const progress = useSharedValue(0);
+  useEffect(() => {
+    progress.value = reduceMotion ? withTiming(open ? 1 : 0, { duration: 0 }) : withSpring(open ? 1 : 0, { damping: 17, stiffness: 190, mass: .8 });
+  }, [open, progress, reduceMotion]);
+  useEffect(() => {
+    if (!open) return;
+    const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
+      setOpen(false);
+      return true;
+    });
+    return () => subscription.remove();
+  }, [open]);
+  const menuStyle = useAnimatedStyle(() => ({
+    opacity: progress.value,
+    transform: [
+      { translateY: interpolate(progress.value, [0, 1], [18, 0]) },
+      { scale: interpolate(progress.value, [0, 1], [.94, 1]) },
+    ],
+  }));
+  const plusStyle = useAnimatedStyle(() => ({
+    transform: [{ rotate: `${interpolate(progress.value, [0, 1], [0, 45])}deg` }],
+  }));
   const items: Array<{ key: Tab; label: string; icon: IconName }> = [
     { key: "home", label: "Home", icon: "home-variant" },
     { key: "alerts", label: "Alerts", icon: "bell" },
     { key: "community", label: "Community", icon: "message-text" },
     { key: "profile", label: "Profile", icon: "account" },
   ];
+  const go = (key: Tab) => { setOpen(false); setTab(key); };
+  const actions = [
+    { label: "Report", icon: "file-document-edit-outline" as IconName, onPress: () => { setOpen(false); onReport(); } },
+    { label: "Heatmap", icon: "map-marker-radius-outline" as IconName, onPress: () => go("heatmap") },
+    { label: "News", icon: "newspaper-variant-outline" as IconName, onPress: () => go("news") },
+    { label: "SOS", icon: "alarm-light-outline" as IconName, onPress: () => { setOpen(false); onSos(); }, danger: true },
+  ];
   return (
-    <View
-      style={[styles.bottomNav, { paddingBottom: bottom, height: 70 + bottom }]}
-    >
-      {items.slice(0, 2).map((item) => (
-        <NavItem
-          key={item.key}
-          item={item}
-          active={tab === item.key}
-          onPress={() => setTab(item.key)}
-          theme={theme}
-          styles={styles}
-        />
-      ))}
-      <View style={styles.fabSlot}>
-        <Pressable
-          accessibilityLabel="Create report"
-          onPress={onReport}
-          style={({ pressed }) => [styles.reportFab, pressed && styles.pressed]}
-        >
-          <MaterialCommunityIcons
-            name="map-marker-plus"
-            size={27}
-            color="#FFFFFF"
-          />
+    <View style={[styles.navLayer, { bottom: bottom + 7 }]} pointerEvents="box-none">
+      <Reanimated.View pointerEvents={open ? "auto" : "none"} style={[styles.navActionPanel, menuStyle]}>
+        <View style={styles.navActionGrid}>{actions.map((action) => <Pressable key={action.label} accessibilityRole="button" accessibilityLabel={action.label} onPress={action.onPress} style={({ pressed }) => [styles.navActionItem, action.danger && styles.navActionDanger, pressed && styles.pressed]}><View style={[styles.navActionIcon, action.danger && styles.navActionDangerIcon]}><MaterialCommunityIcons name={action.icon} size={21} color={action.danger ? theme.error : theme.action} /></View><Text style={[styles.navActionLabel, action.danger && styles.navActionDangerLabel]}>{action.label}</Text></Pressable>)}</View>
+        <Text style={styles.navActionHint}>Quick actions</Text>
+      </Reanimated.View>
+      <View style={styles.navDock}>
+        <View style={styles.navPill}>{items.map((item) => <NavItem key={item.key} item={item} active={tab === item.key} onPress={() => go(item.key)} theme={theme} styles={styles} />)}</View>
+        <Pressable accessibilityRole="button" accessibilityLabel={open ? "Close quick actions" : "Open quick actions"} accessibilityState={{ expanded: open }} onPress={() => setOpen((value) => !value)} style={({ pressed }) => [styles.navPlus, open && styles.navPlusOpen, pressed && styles.pressed]}>
+          <Reanimated.View style={plusStyle}><MaterialCommunityIcons name="plus" size={27} color={open ? theme.onSurface : "#FFFFFF"} /></Reanimated.View>
         </Pressable>
-        <Text style={styles.fabLabel}>Report</Text>
       </View>
-      {items.slice(2).map((item) => (
-        <NavItem
-          key={item.key}
-          item={item}
-          active={tab === item.key}
-          onPress={() => setTab(item.key)}
-          theme={theme}
-          styles={styles}
-        />
-      ))}
     </View>
   );
 }
@@ -2142,18 +2701,10 @@ function NavItem({ item, active, onPress, theme, styles }: any) {
       accessibilityState={{ selected: active }}
       accessibilityLabel={item.label}
       onPress={onPress}
-      style={styles.navItem}
+      style={[styles.navItem, active && styles.navItemActive]}
     >
-      <View style={[styles.navIcon, active && styles.navIconActive]}>
-        <MaterialCommunityIcons
-          name={item.icon}
-          size={21}
-          color={active ? theme.primary : theme.onSurfaceVariant}
-        />
-      </View>
-      <Text style={[styles.navLabel, active && styles.navLabelActive]}>
-        {item.label}
-      </Text>
+      <MaterialCommunityIcons name={item.icon} size={20} color={active ? theme.action : theme.onSurfaceVariant} />
+      {active && <Text maxFontSizeMultiplier={1.15} numberOfLines={1} style={styles.navLabelActive}>{item.label}</Text>}
     </Pressable>
   );
 }
@@ -2231,6 +2782,23 @@ function ChoiceChip({
       >
         {label}
       </Text>
+    </Pressable>
+  );
+}
+
+function HazardChoice({ value, selected, onPress, theme, styles }: any) {
+  const svgIcons: Record<string, React.ComponentType<any>> = {
+    flood: FloodHighIcon,
+    landslide: LandslideIcon,
+    other: DangerZoneIcon,
+  };
+  const materialIcons: Record<string, IconName> = { fire: "fire", storm: "weather-lightning" };
+  const Icon = svgIcons[value];
+  return (
+    <Pressable accessibilityRole="button" accessibilityState={{ selected }} accessibilityLabel={`${value} hazard`} onPress={onPress} style={({ pressed }) => [styles.hazardChoice, selected && styles.hazardChoiceSelected, pressed && styles.pressed]}>
+      {Icon ? <Icon width={30} height={30} /> : <View style={styles.hazardMaterialIcon}><MaterialCommunityIcons name={materialIcons[value] || "alert-circle"} size={22} color={value === "fire" ? theme.error : theme.action} /></View>}
+      <Text style={[styles.hazardChoiceLabel, selected && styles.hazardChoiceLabelSelected]}>{value[0].toUpperCase() + value.slice(1)}</Text>
+      {selected && <MaterialCommunityIcons name="check-circle" size={15} color={theme.action} />}
     </Pressable>
   );
 }
@@ -2566,7 +3134,7 @@ function makeStyles(c: Theme) {
       marginTop: 13,
     },
     home: { flex: 1, backgroundColor: c.background, paddingBottom: 72 },
-    mapArea: { height: "39%", minHeight: 276, position: "relative" },
+    mapArea: { height: "47%", minHeight: 330, position: "relative" },
     mapAttribution: {
       position: "absolute",
       left: 4,
@@ -2584,7 +3152,7 @@ function makeStyles(c: Theme) {
       right: 0,
       bottom: 0,
       left: 0,
-      backgroundColor: "rgba(242,111,76,.035)",
+      backgroundColor: "rgba(0,127,139,.025)",
     },
     mapOverlay: { position: "absolute", top: 0, left: 0, right: 0 },
     topBar: {
@@ -2595,9 +3163,9 @@ function makeStyles(c: Theme) {
       flexDirection: "row",
       alignItems: "center",
       justifyContent: "space-between",
-      borderRadius: 16,
-      backgroundColor: c.surface,
-      elevation: 3,
+      borderRadius: 12,
+      backgroundColor: c.action,
+      elevation: 5,
     },
     brandLockup: {
       flexDirection: "row",
@@ -2619,13 +3187,13 @@ function makeStyles(c: Theme) {
       height: 36,
       resizeMode: "cover",
     },
-    brandText: { ...type.labelLarge, color: c.trustNavy, letterSpacing: 2 },
+    brandText: { ...type.labelLarge, color: "#FFFFFF", letterSpacing: 2 },
     topBarActions: { flexDirection: "row", alignItems: "center", gap: 8 },
     iconButton: {
       width: 48,
       height: 48,
-      borderRadius: 14,
-      backgroundColor: c.peachSoft,
+      borderRadius: 10,
+      backgroundColor: "rgba(255,255,255,.92)",
       alignItems: "center",
       justifyContent: "center",
     },
@@ -2676,17 +3244,18 @@ function makeStyles(c: Theme) {
       position: "absolute",
       left: 14,
       right: 14,
-      bottom: 24,
+      bottom: 18,
       minHeight: 58,
       paddingHorizontal: 12,
       paddingVertical: 9,
-      borderRadius: 16,
+      borderRadius: 10,
       backgroundColor: c.surface,
       flexDirection: "row",
       alignItems: "center",
       justifyContent: "space-between",
       gap: 10,
-      elevation: 4,
+      borderWidth: 1,
+      borderColor: c.outline,
     },
     mapLocationGroup: {
       minWidth: 0,
@@ -2706,9 +3275,9 @@ function makeStyles(c: Theme) {
     legendText: { ...type.labelSmall, color: c.onSurfaceVariant },
     safetySheet: {
       flex: 1,
-      marginTop: -22,
-      borderTopLeftRadius: 26,
-      borderTopRightRadius: 26,
+      marginTop: 0,
+      borderTopWidth: 3,
+      borderTopColor: c.action,
       backgroundColor: c.background,
       overflow: "hidden",
     },
@@ -2735,7 +3304,7 @@ function makeStyles(c: Theme) {
     },
     weatherRail: {
       minHeight: 62,
-      borderRadius: 14,
+      borderRadius: 10,
       backgroundColor: c.primary,
       paddingHorizontal: 13,
       paddingVertical: 11,
@@ -2764,6 +3333,33 @@ function makeStyles(c: Theme) {
       marginBottom: 10,
     },
     outboxText: { ...type.bodySmall, color: c.onSurface, flex: 1 },
+    reportReceipt: {
+      minHeight: 62,
+      borderRadius: 12,
+      backgroundColor: c.secondaryContainer,
+      borderWidth: 1,
+      borderColor: c.secondary,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 10,
+      marginBottom: 10,
+    },
+    reportReceiptQueued: {
+      backgroundColor: c.amberContainer,
+      borderColor: c.amber,
+    },
+    reportReceiptIcon: {
+      width: 34,
+      height: 34,
+      borderRadius: 17,
+      backgroundColor: c.surface,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    reportReceiptTitle: { ...type.labelLarge, color: c.onSurface },
+    reportReceiptBody: { ...type.bodySmall, color: c.onSurfaceVariant, marginTop: 1 },
     officialAlert: {
       borderRadius: 14,
       backgroundColor: c.surface,
@@ -2802,13 +3398,14 @@ function makeStyles(c: Theme) {
     actionStack: { gap: 10, marginTop: 4 },
     actionCard: {
       minHeight: 78,
-      borderRadius: 16,
+      borderRadius: 12,
       backgroundColor: c.surface,
       padding: 13,
       flexDirection: "row",
       alignItems: "center",
       gap: 12,
-      elevation: 2,
+      borderWidth: 1,
+      borderColor: c.outline,
     },
     sosCard: { backgroundColor: c.errorContainer },
     actionIcon: {
@@ -2976,7 +3573,7 @@ function makeStyles(c: Theme) {
       flexDirection: "row",
       alignItems: "center",
       justifyContent: "space-between",
-      backgroundColor: c.peach,
+      backgroundColor: c.primary,
     },
     screenEyebrow: { ...type.labelSmall, color: "#FFFFFF", letterSpacing: 1.1 },
     screenTitle: { ...type.headlineLarge, color: "#FFFFFF", marginTop: 2 },
@@ -3049,6 +3646,10 @@ function makeStyles(c: Theme) {
       marginLeft: "auto",
     },
     messageBody: { ...type.bodyMedium, color: c.onSurface, marginTop: 5 },
+    translationRow: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 8 },
+    communityTranslationNote: { ...type.bodySmall, color: c.secondary, flex: 1 },
+    translationUnavailable: { ...type.bodySmall, color: c.onSurfaceVariant, flex: 1 },
+    translationToggle: { ...type.labelSmall, color: c.secondary, textDecorationLine: "underline" },
     composer: {
       position: "absolute",
       left: 12,
@@ -3128,9 +3729,11 @@ function makeStyles(c: Theme) {
       flex: 1,
     },
     settingsCard: {
-      borderRadius: 16,
+      borderRadius: 12,
       overflow: "hidden",
       backgroundColor: c.surface,
+      borderWidth: 1,
+      borderColor: c.outline,
     },
     settingRow: {
       minHeight: 64,
@@ -3164,6 +3767,42 @@ function makeStyles(c: Theme) {
       gap: 8,
     },
     outlinedButtonText: { ...type.labelLarge, color: c.primary },
+    relayPanel: {
+      padding: 16,
+      borderRadius: 12,
+      backgroundColor: c.surface,
+      borderWidth: 1,
+      borderColor: c.outline,
+    },
+    relayTitleRow: {
+      flexDirection: "row",
+      alignItems: "flex-start",
+      gap: 11,
+    },
+    relayTitle: { ...type.titleMedium, color: c.onSurface },
+    relayBody: {
+      ...type.bodySmall,
+      color: c.onSurfaceVariant,
+      marginTop: 4,
+    },
+    relayButton: {
+      minHeight: 50,
+      marginTop: 14,
+      borderRadius: 10,
+      paddingHorizontal: 16,
+      backgroundColor: c.secondary,
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: 8,
+    },
+    relayButtonText: { ...type.labelLarge, color: "#FFFFFF" },
+    relayPrivacy: {
+      ...type.bodySmall,
+      color: c.onSurfaceVariant,
+      marginTop: 10,
+      textAlign: "center",
+    },
     prototypeCard: {
       borderRadius: 14,
       backgroundColor: c.amberContainer,
@@ -3186,27 +3825,153 @@ function makeStyles(c: Theme) {
       textAlign: "center",
       marginTop: 5,
     },
+    dbScreen: { flex: 1, backgroundColor: c.background, paddingBottom: 78 },
+    dbHeader: {
+      minHeight: 66,
+      paddingHorizontal: 18,
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: c.outline,
+      backgroundColor: c.surface,
+    },
+    dbBrand: { flexDirection: "row", alignItems: "center", gap: 9 },
+    dbLogo: { width: 34, height: 34, borderRadius: 9, resizeMode: "cover", backgroundColor: "#000000" },
+    dbBrandName: { ...type.labelLarge, color: c.onSurface, letterSpacing: 1.8 },
+    dbBrandMeta: { ...type.bodySmall, color: c.onSurfaceVariant, marginTop: 1 },
+    dbHeaderActions: { flexDirection: "row", alignItems: "center", gap: 7 },
+    dbLanguage: { width: 48, height: 48, borderRadius: 15, alignItems: "center", justifyContent: "center", backgroundColor: c.surfaceVariant },
+    dbLanguageText: { ...type.labelSmall, color: c.action },
+    dbContent: { paddingHorizontal: 18, paddingTop: 20, paddingBottom: 112 },
+    dbGreeting: { flexDirection: "row", alignItems: "center", gap: 12 },
+    dbEyebrow: { ...type.bodySmall, color: c.onSurfaceVariant },
+    dbHeadline: { ...type.headlineSmall, color: c.onSurface, marginTop: 3, maxWidth: 295 },
+    dbSubhead: { ...type.bodySmall, color: c.onSurfaceVariant, marginTop: 5 },
+    dbShield: { width: 46, height: 46, borderRadius: 15, backgroundColor: c.actionContainer, alignItems: "center", justifyContent: "center" },
+    dbWeather: { minHeight: 92, marginTop: 18, borderRadius: 18, padding: 15, flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: c.weatherBand },
+    dbWeatherIcon: { width: 43, height: 43, borderRadius: 14, alignItems: "center", justifyContent: "center", backgroundColor: "rgba(255,255,255,.13)" },
+    dbWeatherLabel: { ...type.bodySmall, color: "#CFE0FF" },
+    dbWeatherValue: { ...type.headlineSmall, color: "#FFFFFF", marginTop: 1 },
+    dbWeatherFacts: { alignItems: "flex-end", gap: 4 },
+    dbWeatherFact: { ...type.labelMedium, color: "#FFFFFF" },
+    dbWeatherSource: { ...type.bodySmall, color: "#A6C9EE", maxWidth: 100, textAlign: "right" },
+    dbSectionHead: { marginTop: 22, marginBottom: 10, minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 },
+    dbSectionTitle: { ...type.titleMedium, color: c.onSurface },
+    dbSectionMeta: { ...type.bodySmall, color: c.onSurfaceVariant },
+    dbSectionLink: { ...type.labelMedium, color: c.action },
+    dbSectionCaption: { ...type.bodySmall, color: c.onSurfaceVariant, marginTop: 2 },
+    dbMetrics: { flexDirection: "row", flexWrap: "wrap", borderRadius: 18, overflow: "hidden", backgroundColor: c.surface, borderWidth: StyleSheet.hairlineWidth, borderColor: c.outline },
+    dbMetric: { width: "50%", minHeight: 104, padding: 13, borderRightWidth: StyleSheet.hairlineWidth, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: c.outline },
+    dbMetricIcon: { width: 31, height: 31, borderRadius: 10, alignItems: "center", justifyContent: "center", marginBottom: 9 },
+    dbMetricValue: { ...type.titleMedium, color: c.onSurface },
+    dbMetricLabel: { ...type.bodySmall, color: c.onSurfaceVariant, marginTop: 2 },
+    dbActions: { gap: 9 },
+    dbAction: { minHeight: 70, borderRadius: 17, paddingHorizontal: 13, flexDirection: "row", alignItems: "center", gap: 12, backgroundColor: c.surface, borderWidth: 1, borderColor: c.outline },
+    dbSosAction: { backgroundColor: c.errorContainer, borderColor: "transparent" },
+    dbSosIcon: { width: 36, height: 36, borderRadius: 12, alignItems: "center", justifyContent: "center", backgroundColor: c.error },
+    dbActionTitle: { ...type.labelLarge, color: c.onSurface },
+    dbActionMeta: { ...type.bodySmall, color: c.onSurfaceVariant, marginTop: 2 },
+    dbProcess: { marginTop: 4, paddingBottom: 16, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: c.outline },
+    dbFooterNote: { marginTop: 18, padding: 12, borderRadius: 14, flexDirection: "row", gap: 8, backgroundColor: c.surfaceVariant },
+    hmScreen: { flex: 1, backgroundColor: c.background, paddingBottom: 76 },
+    hmHeader: { minHeight: 76, paddingHorizontal: 18, flexDirection: "row", alignItems: "center", justifyContent: "space-between", backgroundColor: c.surface },
+    hmEyebrow: { ...type.labelSmall, color: c.action, letterSpacing: 1.1 },
+    hmTitle: { ...type.headlineSmall, color: c.onSurface, marginTop: 2 },
+    hmMapWrap: { height: "50%", minHeight: 280, position: "relative", borderTopWidth: StyleSheet.hairlineWidth, borderColor: c.outline },
+    hmMapFallback: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, zIndex: 3, alignItems: "center", justifyContent: "center", padding: 22, backgroundColor: c.surfaceVariant },
+    hmMapFallbackTitle: { ...type.labelLarge, color: c.onSurface, marginTop: 8 },
+    hmMapFallbackBody: { ...type.bodySmall, color: c.onSurfaceVariant, marginTop: 3, textAlign: "center" },
+    hmLegend: { position: "absolute", top: 12, left: 12, minHeight: 38, paddingHorizontal: 11, borderRadius: 12, flexDirection: "row", alignItems: "center", gap: 7, backgroundColor: c.surface, elevation: 4 },
+    hmLegendDot: { width: 9, height: 9, borderRadius: 5, backgroundColor: c.error },
+    hmLegendText: { ...type.labelSmall, color: c.onSurface },
+    hmLocation: { position: "absolute", left: 12, bottom: 12, minHeight: 40, paddingHorizontal: 11, borderRadius: 12, flexDirection: "row", alignItems: "center", gap: 7, backgroundColor: c.surface, elevation: 4 },
+    hmLocationText: { ...type.bodySmall, color: c.onSurface },
+    hmSheet: { flex: 1, marginTop: -18, borderTopLeftRadius: 22, borderTopRightRadius: 22, backgroundColor: c.background, paddingHorizontal: 18, overflow: "hidden" },
+    hmHandle: { width: 36, height: 4, borderRadius: 2, backgroundColor: c.outline, alignSelf: "center", marginTop: 10 },
+    hmList: { paddingBottom: 104 },
+    hmItem: { minHeight: 66, paddingVertical: 10, flexDirection: "row", alignItems: "center", gap: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: c.outline },
+    hmIndex: { width: 36, height: 36, borderRadius: 12, alignItems: "center", justifyContent: "center", backgroundColor: c.errorContainer },
+    hmIndexText: { ...type.labelSmall, color: c.error, fontVariant: ["tabular-nums"] },
+    hmItemTitle: { ...type.labelLarge, color: c.onSurface },
+    hmItemMeta: { ...type.bodySmall, color: c.onSurfaceVariant, marginTop: 2 },
+    newsContent: { padding: 18, paddingBottom: 110 },
+    newsIntro: { ...type.bodyMedium, color: c.onSurfaceVariant, marginBottom: 18, maxWidth: 330 },
+    newsCard: { paddingVertical: 17, flexDirection: "row", alignItems: "flex-start", gap: 14, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: c.outline },
+    newsNumber: { ...type.labelMedium, color: c.action, fontVariant: ["tabular-nums"] },
+    newsTitle: { ...type.titleLarge, color: c.onSurface, marginTop: 4 },
+    newsBody: { ...type.bodyMedium, color: c.onSurfaceVariant, marginTop: 6 },
+    newsTime: { ...type.bodySmall, color: c.onSurfaceVariant, marginTop: 10 },
+    chatScreen: { flex: 1, backgroundColor: c.background, paddingBottom: 76 },
+    chatListHeader: { minHeight: 76, paddingHorizontal: 18, flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+    chatEyebrow: { ...type.labelSmall, color: c.action, letterSpacing: 1 },
+    chatListTitle: { ...type.headlineLarge, color: c.onSurface, marginTop: 1 },
+    chatHeaderIcon: { width: 42, height: 42, borderRadius: 14, alignItems: "center", justifyContent: "center", backgroundColor: c.actionContainer },
+    chatSearch: { minHeight: 46, marginHorizontal: 18, paddingHorizontal: 13, borderRadius: 14, flexDirection: "row", alignItems: "center", gap: 9, backgroundColor: c.surfaceVariant },
+    chatSearchInput: { flex: 1, color: c.onSurface, ...type.bodyMedium },
+    chatFilterRow: { paddingHorizontal: 18, paddingVertical: 12, flexDirection: "row", gap: 8 },
+    chatFilterActive: { minHeight: 34, paddingHorizontal: 14, borderRadius: 17, alignItems: "center", justifyContent: "center", backgroundColor: c.action },
+    chatFilterActiveText: { ...type.labelSmall, color: "#FFFFFF" },
+    chatFilter: { minHeight: 34, paddingHorizontal: 14, borderRadius: 17, alignItems: "center", justifyContent: "center", backgroundColor: c.surfaceVariant },
+    chatFilterText: { ...type.labelSmall, color: c.onSurfaceVariant },
+    chatList: { paddingHorizontal: 18, paddingBottom: 105 },
+    chatRow: { minHeight: 78, flexDirection: "row", alignItems: "center", gap: 12, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: c.outline },
+    chatAvatar: { width: 48, height: 48, borderRadius: 24, alignItems: "center", justifyContent: "center", backgroundColor: c.primary },
+    chatAvatarText: { ...type.labelLarge, color: "#FFFFFF" },
+    chatRowBody: { flex: 1, minWidth: 0 },
+    chatRowHead: { flexDirection: "row", alignItems: "center", gap: 8 },
+    chatRowName: { ...type.labelLarge, color: c.onSurface, flex: 1 },
+    chatRowTime: { ...type.bodySmall, color: c.onSurfaceVariant },
+    chatPreviewRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 5 },
+    chatPreview: { ...type.bodySmall, color: c.onSurfaceVariant, flex: 1 },
+    chatRoomHeader: { minHeight: 70, paddingHorizontal: 10, flexDirection: "row", alignItems: "center", gap: 9, backgroundColor: c.surface, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: c.outline },
+    chatBack: { width: 48, height: 48, borderRadius: 15, alignItems: "center", justifyContent: "center" },
+    chatRoomAvatar: { width: 39, height: 39, borderRadius: 20, alignItems: "center", justifyContent: "center", backgroundColor: c.primary },
+    chatRoomAvatarText: { ...type.labelMedium, color: "#FFFFFF" },
+    chatRoomTitle: { ...type.labelLarge, color: c.onSurface },
+    chatRoomMeta: { ...type.bodySmall, color: c.onSurfaceVariant, marginTop: 1 },
+    chatMessageContent: { padding: 14, paddingTop: 16, paddingBottom: 154 },
+    chatBubble: { alignSelf: "flex-start", maxWidth: "84%", borderRadius: 16, borderTopLeftRadius: 4, padding: 11, marginBottom: 8, backgroundColor: c.surface },
+    chatBubbleMine: { alignSelf: "flex-end", borderTopLeftRadius: 16, borderTopRightRadius: 4, backgroundColor: c.actionContainer },
+    chatComposerField: { flex: 1, minHeight: 48, maxHeight: 104, borderRadius: 15, paddingHorizontal: 12, flexDirection: "row", alignItems: "center", gap: 7, backgroundColor: c.surfaceVariant },
+    chatComposerInput: { flex: 1, maxHeight: 94, paddingVertical: 10, color: c.onSurface, ...type.bodyMedium },
+    navLayer: { position: "absolute", left: 12, right: 12, height: 330, zIndex: 40, elevation: 20 },
+    navDock: { position: "absolute", left: 0, right: 0, bottom: 0, height: 62, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 9 },
+    navPill: { height: 58, flex: 1, maxWidth: 330, borderRadius: 29, paddingHorizontal: 6, flexDirection: "row", alignItems: "center", backgroundColor: c.surface, borderWidth: 1, borderColor: c.outline, elevation: 12 },
+    navPlus: { width: 58, height: 58, borderRadius: 29, alignItems: "center", justifyContent: "center", backgroundColor: c.action, elevation: 12 },
+    navPlusOpen: { backgroundColor: c.surface, borderWidth: 1, borderColor: c.outline },
+    navActionPanel: { position: "absolute", right: 0, bottom: 70, width: 224, borderRadius: 22, padding: 11, backgroundColor: c.surface, borderWidth: 1, borderColor: c.outline, elevation: 18 },
+    navActionGrid: { flexDirection: "row", flexWrap: "wrap", gap: 7 },
+    navActionItem: { width: "48%", minHeight: 68, padding: 9, borderRadius: 15, justifyContent: "space-between", backgroundColor: c.surfaceVariant },
+    navActionDanger: { backgroundColor: c.errorContainer },
+    navActionIcon: { width: 32, height: 32, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: c.actionContainer },
+    navActionDangerIcon: { backgroundColor: "rgba(197,46,66,.10)" },
+    navActionLabel: { ...type.labelSmall, color: c.onSurface },
+    navActionDangerLabel: { color: c.error },
+    navActionHint: { ...type.bodySmall, color: c.onSurfaceVariant, textAlign: "center", marginTop: 9 },
     bottomNav: {
       position: "absolute",
       left: 0,
       right: 0,
       bottom: 0,
       minHeight: 78,
-      backgroundColor: c.surface,
-      borderTopWidth: StyleSheet.hairlineWidth,
-      borderTopColor: c.outline,
+      backgroundColor: "#111820",
       flexDirection: "row",
       alignItems: "flex-start",
       paddingHorizontal: 6,
       paddingTop: 6,
-      elevation: 12,
+      elevation: 14,
     },
     navItem: {
       flex: 1,
-      minHeight: 56,
+      minHeight: 48,
+      borderRadius: 18,
+      flexDirection: "row",
+      gap: 5,
       alignItems: "center",
       justifyContent: "center",
     },
+    navItemActive: { backgroundColor: c.actionContainer, paddingHorizontal: 6 },
     navIcon: {
       width: 52,
       height: 30,
@@ -3214,23 +3979,23 @@ function makeStyles(c: Theme) {
       alignItems: "center",
       justifyContent: "center",
     },
-    navIconActive: { backgroundColor: c.peachSoft },
-    navLabel: { ...type.labelSmall, color: c.onSurfaceVariant, marginTop: 1 },
-    navLabelActive: { color: c.primary },
+    navIconActive: { backgroundColor: c.action },
+    navLabel: { ...type.labelSmall, color: "#AEB8BC", marginTop: 1 },
+    navLabelActive: { ...type.labelSmall, color: c.action },
     fabSlot: { flex: 1, alignItems: "center", minHeight: 68 },
     reportFab: {
       width: 60,
       height: 60,
       borderRadius: 30,
-      backgroundColor: c.primary,
+      backgroundColor: c.action,
       marginTop: -21,
       alignItems: "center",
       justifyContent: "center",
       elevation: 8,
       borderWidth: 3,
-      borderColor: c.surface,
+      borderColor: "#111820",
     },
-    fabLabel: { ...type.labelSmall, color: c.primary, marginTop: 1 },
+    fabLabel: { ...type.labelSmall, color: "#FFFFFF", marginTop: 1 },
     compactSos: {
       position: "absolute",
       left: 12,
@@ -3267,9 +4032,9 @@ function makeStyles(c: Theme) {
       justifyContent: "flex-end",
     },
     reportSheet: {
-      maxHeight: "94%",
-      borderTopLeftRadius: 28,
-      borderTopRightRadius: 28,
+      maxHeight: "96%",
+      borderTopLeftRadius: 18,
+      borderTopRightRadius: 18,
       backgroundColor: c.background,
       overflow: "hidden",
     },
@@ -3291,6 +4056,32 @@ function makeStyles(c: Theme) {
     modalEyebrow: { ...type.labelSmall, color: c.primary, letterSpacing: 1 },
     modalTitle: { ...type.headlineSmall, color: c.onSurface, marginTop: 2 },
     reportContent: { paddingHorizontal: 20, paddingBottom: 34 },
+    hazardGrid: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+    hazardChoice: { width: "31%", minHeight: 86, borderRadius: 15, padding: 9, alignItems: "center", justifyContent: "center", gap: 6, backgroundColor: c.surface, borderWidth: 1, borderColor: c.outline },
+    hazardChoiceSelected: { backgroundColor: c.actionContainer, borderColor: c.action },
+    hazardMaterialIcon: { width: 30, height: 30, borderRadius: 15, alignItems: "center", justifyContent: "center", backgroundColor: c.errorContainer },
+    hazardChoiceLabel: { ...type.labelSmall, color: c.onSurfaceVariant },
+    hazardChoiceLabelSelected: { color: c.action },
+    reportStepHead: {
+      flexDirection: "row",
+      alignItems: "flex-start",
+      gap: 12,
+      marginTop: 20,
+      paddingTop: 18,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: c.outline,
+    },
+    reportStepNumber: {
+      ...type.labelMedium,
+      color: c.secondary,
+      fontVariant: ["tabular-nums"],
+    },
+    reportStepTitle: { ...type.titleMedium, color: c.onSurface },
+    reportStepBody: {
+      ...type.bodySmall,
+      color: c.onSurfaceVariant,
+      marginTop: 3,
+    },
     evidenceGrid: { flexDirection: "row", gap: 8 },
     evidenceButton: {
       flex: 1,

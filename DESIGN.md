@@ -4,66 +4,110 @@
 
 ## Direction
 
-BEACON is a modern lighthouse watch desk with two expressions. The authority floor combines the supplied warm civic identity with the cleaner municipal workspace structure demonstrated by the RaipurOne dashboard reference: collapsible navigation, a white sticky work header, neutral status summaries, a header-above-map frame, functional map filters, and progressive AI detail. The citizen client follows the supplied peach/coral mobile reference with white cards and compact rounded rows. Maps carry spatial truth in both, while red remains exceptional for an active emergency.
+BEACON is a contemporary Indian public-infrastructure field console. It takes its discipline from transit wayfinding, survey maps, field notebooks, and control-room switchboards: clear bands, direct labels, strong alignment, and visible operating state. It must look designed by a civic product team, not generated from a dashboard template.
 
-The approved product mark is `ui-app/logo.png`: a white lighthouse, broadcast arcs and India silhouette on a black field. Use this exact raster for the dashboard, citizen app, launcher icon, splash identity and browser icon; do not redraw or substitute the lighthouse symbol.
+The citizen path is `locate → understand → report or request help → track`. The authority path is `scan → inspect → verify → communicate → respond`. Maps are stable work surfaces, not hero decoration. Forms are sequential field records, not a cloud of chips and cards.
+
+The approved product mark is `ui-app/logo.png`: a white lighthouse, broadcast arcs and India silhouette on a black field. Use this exact raster for dashboard, citizen app, launcher, splash and browser identity.
 
 ## Color roles
 
-- Watch-floor navy `#0B2B42`: navigation, analysis provenance, and primary action.
-- Signal teal `#087F73`: live connection, verified information, location, and safe action.
-- Citizen coral `#F26F4C`, peach `#F8B89E`, and soft peach `#FFF0E9`: native headers, selected controls, the report FAB, and friendly emphasis. Coral does not encode verification.
-- Warm paper `#F6F5EF` and surface `#FFFEFA`: long-session working backgrounds.
-- Amber `#C97817`: unverified or elevated risk only.
-- Red `#BD3B34`: active SOS and critical danger only.
-- Ink `#102B42`, muted `#63727B`, and line `#D8DDD8`: copy, supporting text, and separation.
+- Control charcoal `#111820`: navigation, primary controls, strong information bands and analysis provenance.
+- Signal cyan `#007F8B`: live connectivity, selected navigation, verified information and active location.
+- Mineral white `#FFFFFF` and field ground `#F1F3F1`: reading and working surfaces.
+- Structural gray `#C8D0CF`: dividers, fields and inactive controls.
+- Safety yellow `#F0C34B` / text-safe amber `#A87500`: attention, queued work and report creation.
+- Emergency red `#C93138`: active SOS and critical danger only.
+- Ink `#111820` and secondary ink `#53616B`: primary and supporting copy.
 
-Status must never rely on color alone. Every status pairs color with a word, icon, or both.
+No gradients, decorative glass, colored glow, random pastel cards, or color without a text/icon status cue.
 
 ## Typography
 
-- Manrope Variable is the operational face for controls, labels, body copy, and dense data.
-- Newsreader Variable is the human voice for screen and panel titles.
-- Tabular operational values use lining numerals. Labels use restrained uppercase tracking only when they behave like instrument annotations.
+- Manrope Variable is the web operational face. Native uses the Android system face for platform familiarity and performance.
+- Titles are direct, compact and sans-serif; the old editorial serif voice is retired.
+- Tabular operational values use lining numerals.
+- Uppercase is limited to short field labels and state annotations.
 
-## Shape, depth, and spacing
+## Structure
 
-- Working panels use 12–14px radii; compact status controls may be pills.
-- Elevation is a soft navy-tinted shadow with a visible vertical offset. A panel uses either an outline or a shadow, not both.
-- Compact desktop density uses 8/12/16/24px spacing; mobile uses 8/12/18/24px with 48dp minimum targets.
-- The map remains visually dominant. Dashboard evidence and response controls are attached workspaces; the citizen experience uses a rounded safety sheet over the lower map edge.
-- Authority utilities open as full working canvases beside the persistent navigation rail. Incidents, SOS, communities, broadcasts, audit, and delivery history use compact rows and tables rather than dashboard-card grids.
+- Web uses a charcoal navigation rail, white top work bar, dark live-status band, stable map/case workspace and narrow incident rail.
+- Mobile uses a 47% map workspace, a hard boundary into scrolling safety content, and one charcoal bottom command strip.
+- Panels use 8–12px radii and either a divider or shadow, never both.
+- Desktop rhythm is 4/8/10/14/18/24px. Mobile rhythm is 4/8/12/16/20/24px with 48dp minimum targets.
+- Repeated content uses rows, ledgers and indexed lists rather than equal card grids.
 
-## Components
+## Core components
 
-- Trust badges: `Unverified`, `Corroborated`, `Verified`, `Misleading`, and `Outdated`, each with a dot and text.
-- Priority queue: SOS first, then severity, trust, and recency. Every item includes a plain-language reason for its position.
-- Evidence workspace: original content, working translation, requested help, and source time occupy the warm evidence card. The adjacent blue analysis console is explicitly `Advisory only` and presents a five-stage review path: evidence received, language normalized, AI screening, external source check, and authority decision. A correspondence section separately reports Google Fact Check availability, related reporting, source links, last-check time, and the human decision owner. Trust, assignment, bypass, and publication remain human controls in a separate bottom bar.
-- Protected bypass confirmation: verification bypass always interrupts with a focused modal, explains the consequence, requires an operational reason, and names the identity, reason, and timestamp that will enter the immutable audit trail. The red confirmation is reserved for the final consequential action; the safe exit remains visually quieter.
-- Delivery ledger: treat each outbound alert or correction as an ordered series of channel attempts, not a single sent/not-sent flag. Show channel, outcome, detail, and time for in-app realtime, configured push, configured SMS, and queued store-and-forward; `queued` is a durable delivery state, not an error.
-- Map runtime: dashboard and native maps use OpenStreetMap semantics. Native renders Leaflet tiles and markers inside a WebView, including the manual-pin editor, so the demo does not depend on Google Maps authorization. Preserve attribution and never imply offline tile availability.
-- Dashboard map filters: `All`, `Verified`, `Under review`, and `SOS` are real layer controls with visible counts and pressed state. The map heading sits outside the tile canvas so controls never obscure spatial evidence.
-- Trust layers: teal means official or verified, amber means citizen evidence under review, navy marks verified facilities, coral marks the citizen's private position, and red means SOS. Every layer also has a text label; official alert cards remain structurally separate from unverified map claims.
-- Mobile safety sheet: peach/coral controls and white cards sit over the map; greeting, weather risk, official alerts, Report, SOS, the compact report-verification journey, and nearby help appear in that order. Map chrome is limited to one top control dock and one combined location/layer dock.
-- Permission-off state: when precise location is denied, keep the map and cached safety context usable, omit the private-position marker, and say `Approx. area · location off`. Camera and microphone denial use plain-language system alerts and leave text/manual-pin reporting available.
-- Report is the single FAB. SOS is a wide, dedicated hold control.
-- Snackbar communicates transient success, failure, queued state, automatic retry, and reconnect outcomes. Native queued reports and SOS requests retry without asking the citizen to resubmit; realtime alert and dispatch changes update the current state in place.
-- Active SOS banner: a persistent red response strip replaces transient feedback after activation. It shows request status, responder ETA or live-location sharing, and a textual five-second cancellation countdown before settling to a plain Cancel action.
+- Trust badge: dot plus one of `Unverified`, `Corroborated`, `Verified`, `Misleading`, `Outdated`.
+- Incident workbench: persistent incident index beside the selected case file; selection never routes back to Overview.
+- Case file: location map and coordinates, source report, translation, uploaded evidence, five-stage verification, linked external sources, assignment and authority actions.
+- SMS console: title, 280-character safety message, explicit provider/readiness state, configured test-recipient count and realtime delivery ledger.
+- Delivery ledger: in-app, push, SMS and store-and-forward attempts with channel, outcome, detail and time.
+- Mobile report record: three numbered sections—describe incident, set urgency/help, add evidence/location.
+- Nearby relay: exports a PII-safe cached safety pack through Android Quick Share, which can use Bluetooth or Wi‑Fi Direct.
+- SOS: dedicated hold control, numeric cancellation window, live location and responder state. It is never visually merged with ordinary report creation.
 
-## Responsive behavior
+## Responsive and accessibility
 
-- Desktop: 224px navigation rail, a map/evidence column, and a 350px priority rail. The evidence workspace is a 235px incident header beside paired evidence/provenance cards and a full-width decision bar.
-- At 1180px the authority rail collapses to icons while the analysis console moves below citizen evidence and remains available. At 880px navigation moves to the bottom and map, queue, and evidence stack vertically. At 620px evidence, verification correspondence, sources, and actions become single-column.
-- Citizen native: portrait map occupies about 43% of the viewport and the safety sheet scrolls above persistent five-destination navigation with one central Report FAB. Safe-area insets, keyboard avoidance, and 48dp targets are mandatory.
-- Citizen browser simulator remains capped at 460px and follows the same map/sheet hierarchy.
+- At 1180px web navigation collapses to icons. At 880px it becomes bottom navigation and operational regions stack. At 620px case file, source correspondence and actions become single-column.
+- Native supports portrait phones, font scaling, dark/light system themes and safe-area insets.
+- Controls meet 48dp touch targets on native and visible keyboard focus on web.
+- Loading, offline, queued, error, empty, disabled and success states remain textual.
+- Reduced motion removes the repeating SOS scale effect without removing hold progress.
 
-## Motion and accessibility
+## Connectivity truth
 
-- The only repeating authored motion is the hold-to-SOS pulse. All other state changes use native or immediate transitions.
-- `prefers-reduced-motion` removes the SOS scale animation without removing the hold requirement or textual progress.
-- Focus rings use amber with 3px width; contrast meets WCAG AA for body copy; keyboard and screen-reader names are required for icon controls.
-- Every native interactive target is at least 48×48dp, including language choices, map controls, navigation destinations, evidence tools, SOS cancellation, and modal dismissal; use padding to enlarge the hit area without forcing every icon to appear oversized.
-- SOS must expose both phases without relying on motion: hold progress before activation, then the numeric cancellation countdown after activation. Realtime and retry state changes must also remain explicit in text for screen readers and weak-connectivity use.
-- Native light and dark themes use semantic surface, text, outline, coral, teal, amber, and error roles rather than an inverted screenshot. Map labels, floating controls, sheets, fields, and status messages must remain legible in both themes.
-- All 12 supported language choices use horizontally scrollable or wrapping controls, and translated content must tolerate increased font scale without fixed-height text containers.
-- The analysis workspace separates model output from external-source verification. Every source exposes publisher, evidence type, rating when available, a safe outbound link, check time, and an explicit human-decision warning.
+- Wi‑Fi/local network: authenticated WebSocket realtime plus REST retry/outbox synchronization.
+- Bluetooth/Wi‑Fi Direct in Expo Go: user-confirmed Android Quick Share handoff of an offline safety pack.
+- Automatic encrypted peer discovery belongs to a custom Android development build using Nearby Connections; UI must not claim that capability when the native adapter is absent.
+- SMS uses the audited MSG91 adapter and only configured test recipients. Missing credentials produce an honest queued/store-and-forward state.
+
+## Mobile citizen application — current
+
+**Creative north star: “The Civic Field Brief.”** The current citizen path is `understand → report or request help → track → inspect affected areas`. Home is a calm, map-free data dashboard for conditions, connection state, report delivery, SOS, official alerts, affected-area count, emergency actions, verification progress, and nearby facilities. Maps are task-specific work surfaces, not hero decoration.
+
+### Mobile palette and type
+
+- Midnight Command `#07133F`: brand, weather band, high-emphasis information.
+- Royal Action `#2439C9`: primary actions, active navigation, verified operating state.
+- Periwinkle Signal `#728EED` and Pale Safety Blue `#A6C9EE`: dark-theme actions and supporting emphasis.
+- Field Ground `#F6F8FC`, Mineral White `#FFFFFF`, and Structural Blue Gray `#D6DFED`: backgrounds, working surfaces, and dividers.
+- Emergency Red `#C52E42` is reserved for SOS/critical danger; Attention Amber `#9A6700` marks warning or queued work.
+- Dark mode uses `#050A1F` background, `#0B1538` surfaces, and `#121F49` secondary surfaces.
+
+Native type uses Arial on iOS/web and Android sans-serif as a reliable Arial-compatible fallback. The scale is display 32/37; headlines 25/30 and 21/26; titles 18/23 and 15/20; body 15/22, 13/19, and 11/16; labels 13/18, 11/15, and 10/14. Use tabular numerals for operating counts and uppercase only for short eyebrows.
+
+### Mobile hierarchy
+
+1. Home: identity, live state, language, safety headline, weather, citizen metrics, report/SOS, verification journey, facilities.
+2. Alerts: authoritative guidance with a clearly separated unverified-claims summary.
+3. Community: searchable approved-room inbox and WhatsApp-like room with official labels, translated display text, and original-language toggle.
+4. Profile: language, device readiness, outbox, privacy, and nearby relay.
+5. Quick actions: Report, Heatmap, News, and SOS.
+6. Heatmap: authority-only affected-area map, legend, approximate-location label, and indexed briefing sheet.
+7. News: official alert and correction briefs.
+8. Report: one scrollable record divided into `01 Describe`, `02 Urgency`, and `03 Evidence and location`.
+
+### Navigation and motion
+
+A 58dp floating pill contains Home, Alerts, Community, and Profile; only the active destination reveals its label. A separate 58dp plus opens a 2×2 action panel. The panel animates opacity `0→1`, translation `18→0`, and scale `.94→1`; the plus rotates `0→45°`. Reanimated uses damping `17`, stiffness `190`, and mass `.8`. Reduced-motion mode changes state immediately.
+
+### Mobile component rules
+
+- Report hazards use exact disaster-category SVG exports. Selection combines border, background, label, and checkmark, never color alone.
+- Community aligns the current citizen’s messages right and other messages left. Authority messages always carry `OFFICIAL`; translations name the display language and preserve the original.
+- Only authority-verified areas appear in the principal heatmap. Exact citizen coordinates remain private.
+- Ordinary content stays flat; elevation is reserved for floating navigation, action panel, map labels, modal sheets, and transient notices.
+
+### Disaster icon provenance
+
+Disaster SVGs are exact exports from the Figma community file [Disaster Management UI Icon Pack — DMUIP](https://www.figma.com/design/nRQDrGO7sNG5RDkDdjEgSE/Disaster--Management-UI-Icon-Pack---DMUIP--Community-?node-id=2-77), frame `2:77`, retrieved through the Figma MCP. They live in `apps/mobile/assets/disaster/`; preserve their aspect ratios and internal status colors.
+
+### Mobile accessibility guardrails
+
+- Maintain 48dp interactions; smaller visible controls require sufficient hit slop.
+- Preserve all four primary navigation icons under font scaling; hide the active label before clipping an icon.
+- Validate at 130% font scale without fixed-height clipping.
+- Provide roles, labels, selected/expanded state, and non-color status descriptions.
+- SOS remains press-and-hold with textual state and visible progress.

@@ -1,7 +1,13 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Citizen, ContextPayload, QueueItem } from "./types";
 
-const KEYS = { citizen: "beacon.citizen.v2", device: "beacon.device.v1", context: "beacon.context.v2", queue: "beacon.outbox.v2" };
+const KEYS = { citizen: "beacon.citizen.v2", device: "beacon.device.v1", context: "beacon.context.v2", queue: "beacon.outbox.v2", lastReport: "beacon.last-report.v1" };
+
+export type StoredReportReceipt = {
+  status: "sent" | "queued";
+  reportId?: string;
+  updatedAt: string;
+};
 
 export async function readCitizen() {
   const value = await AsyncStorage.getItem(KEYS.citizen);
@@ -34,4 +40,11 @@ export async function enqueue(item: QueueItem) {
   await writeQueue(queue);
   return queue.length;
 }
-
+export async function readLastReport() {
+  const value = await AsyncStorage.getItem(KEYS.lastReport);
+  return value ? JSON.parse(value) as StoredReportReceipt : null;
+}
+export async function writeLastReport(value: StoredReportReceipt | null) {
+  if (value) await AsyncStorage.setItem(KEYS.lastReport, JSON.stringify(value));
+  else await AsyncStorage.removeItem(KEYS.lastReport);
+}

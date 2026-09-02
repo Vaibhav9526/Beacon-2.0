@@ -11,7 +11,7 @@ export type Language =
   | "kn"
   | "ml"
   | "or";
-export type Tab = "home" | "alerts" | "community" | "profile";
+export type Tab = "home" | "alerts" | "community" | "profile" | "heatmap" | "news";
 export type ConnectionState = "connecting" | "live" | "offline";
 
 export type Coordinate = { latitude: number; longitude: number };
@@ -49,7 +49,7 @@ export type IncidentMarker = Coordinate & {
   title: string;
   approximate_area: string;
   severity: string;
-  trust_state: "Unverified" | "Corroborated";
+  trust_state: "Unverified" | "Corroborated" | "Verified" | "Misleading" | "Outdated";
   report_count?: number;
 };
 
@@ -66,6 +66,13 @@ export type CommunityMessage = {
   sender_name: string;
   sender_role: string;
   body: string;
+  original_body: string;
+  source_language: Language;
+  display_language: Language;
+  requested_language?: Language;
+  translated: boolean;
+  translation_available: boolean;
+  translation_provider: string;
   official: boolean;
   created_at?: string;
 };

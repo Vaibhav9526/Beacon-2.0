@@ -26,6 +26,7 @@ export class BeaconClient implements BeaconPort {
       requested_help: draft.requestedHelp || "", latitude: String(draft.latitude), longitude: String(draft.longitude), language: session.language,
     };
     Object.entries(fields).forEach(([key, value]) => form.set(key, value));
+    form.set("evidence_count", String(files.length));
     files.forEach((file) => {
       const copy = new Uint8Array(file.bytes.byteLength);
       copy.set(file.bytes);

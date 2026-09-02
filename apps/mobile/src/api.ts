@@ -1,4 +1,5 @@
 import Constants from "expo-constants";
+import { File } from "expo-file-system";
 import { Community, ContextPayload, ReportDraft, SosRequest } from "./types";
 
 const configured = process.env.EXPO_PUBLIC_API_URL?.replace(/\/$/, "");
@@ -17,9 +18,26 @@ const candidates = Array.from(
 
 let baseUrl = candidates[0];
 let sessionToken: string | undefined;
+let renewSession: (() => Promise<string | undefined>) | undefined;
+let renewalInFlight: Promise<string | undefined> | null = null;
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
 
 export function setSessionToken(token?: string) {
   sessionToken = token;
+}
+
+export function setSessionRenewal(handler?: () => Promise<string | undefined>) {
+  renewSession = handler;
+  if (!handler) renewalInFlight = null;
 }
 
 async function timedFetch(url: string, init?: RequestInit, timeout = 6500) {
@@ -57,14 +75,37 @@ export function getWebSocketUrl() {
   return `${baseUrl.replace(/^http/, "ws")}/ws${query}`;
 }
 
-export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  retrySession = true,
+  timeout = 10_000,
+): Promise<T> {
   const headers = new Headers(init?.headers);
   if (sessionToken) headers.set("Authorization", `Bearer ${sessionToken}`);
-  const response = await timedFetch(`${baseUrl}${path}`, { ...init, headers });
+  const response = await timedFetch(`${baseUrl}${path}`, { ...init, headers }, timeout);
   const payload = await response.json().catch(() => null);
+  if (response.status === 401 && retrySession && renewSession) {
+    renewalInFlight ||= renewSession().finally(() => {
+      renewalInFlight = null;
+    });
+    const refreshedToken = await renewalInFlight;
+    if (refreshedToken) {
+      sessionToken = refreshedToken;
+      return request<T>(path, init, false, timeout);
+    }
+  }
   if (!response.ok)
-    throw new Error(payload?.detail || "BEACON service is unavailable");
+    throw new ApiError(payload?.detail || "BEACON service is unavailable", response.status);
   return payload as T;
+}
+
+export async function api<T>(
+  path: string,
+  init?: RequestInit,
+  timeout?: number,
+): Promise<T> {
+  return request<T>(path, init, true, timeout);
 }
 
 export function json(method: "POST" | "PATCH", value: unknown): RequestInit {
@@ -92,23 +133,29 @@ export function reportForm(payload: ReportDraft & { citizen_id: string }) {
   form.append("requested_help", payload.requested_help);
   form.append("latitude", String(payload.coordinate.latitude));
   form.append("longitude", String(payload.coordinate.longitude));
-  payload.attachments.forEach((attachment) =>
-    form.append("media", {
-      uri: attachment.uri,
-      name: attachment.name,
-      type: attachment.mimeType,
-    } as unknown as Blob),
-  );
+  form.append("evidence_count", String(payload.attachments.length));
+  payload.attachments.forEach((attachment) => {
+    const file = new File(attachment.uri);
+    if (!file.exists || file.size <= 0)
+      throw new ApiError(`${attachment.name} is empty or no longer available`, 400);
+    // Expo 57 installs its WinterCG fetch implementation. It serializes Blob/File
+    // values by reading their bytes; React Native's legacy { uri, name, type }
+    // descriptor is explicitly unsupported by that implementation.
+    form.append("media", file);
+  });
   return form;
 }
 
 export async function submitReport(
   payload: ReportDraft & { citizen_id: string },
 ) {
-  return api<{ report_id: string }>("/reports", {
+  const result = await api<{ report_id: string; media: Array<{ bytes: number; url: string }> }>("/reports", {
     method: "POST",
     body: reportForm(payload),
-  });
+  }, 120_000);
+  if (result.media.length !== payload.attachments.length)
+    throw new ApiError("The report arrived but one or more evidence files were not retained", 502);
+  return result;
 }
 
 export async function submitSos(payload: {

@@ -6,6 +6,7 @@
     "dev:web": "npm --workspace apps/dashboard run dev",
     "build:web": "npm --workspace apps/dashboard run build",
     "dev:mobile": "npm --workspace apps/mobile run start",
+    "dev:mobile:usb": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/mobile-usb.ps1",
     "dev:api": "npm --workspace apps/api run dev",
     "dev:telegram": "npm --workspace apps/telegram-bot run dev",
     "build:api": "npm --workspace apps/api run build",
