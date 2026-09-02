@@ -12,7 +12,9 @@ backend/.venv/
 apps/dashboard/.next-stale-*/
 .env
 .env.local
-.impeccable/review/
+.impeccable/review/*
+!.impeccable/review/final-light.png
+!.impeccable/review/report-form.png
 
 # Local design explorations and reference material
 /design/
