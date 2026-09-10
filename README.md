@@ -231,3 +231,6 @@ BEACON deliberately separates machine assistance from public authority. Related 
 
 
 ## Developed by Vaibhav sharma.
+
+
+### All rights reserved.
