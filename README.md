@@ -228,3 +228,6 @@ scripts/         Local smoke tests and development utilities
 ## Safety model
 
 BEACON deliberately separates machine assistance from public authority. Related coverage is context rather than proof, model confidence is not a truth score, and only an authenticated official can publish a verified alert or correction.
+
+
+## Developed by Vaibhav sharma.
